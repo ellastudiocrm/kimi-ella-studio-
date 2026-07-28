@@ -68,7 +68,8 @@ BEGIN
         jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
             'profissional_id','33333333-3333-3333-3333-333333333333',
             'cardapio', 'ella_studio',
-            'inicio', teste_proximo_dia(3,'10:00'))),
+            'inicio', teste_proximo_dia(2,'11:00'))),
+        'd2-sinal-30');
         'd2-sinal-30');
     v_r := (v->>'reserva_id')::UUID;
 
