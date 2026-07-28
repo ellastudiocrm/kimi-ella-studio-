@@ -1,0 +1,3561 @@
+-- CRM ELLA Studio v3.4.2 — MIGRATIONS CONSOLIDADAS (12 migrations + seed)
+-- Fonte da verdade: os ficheiros individuais em supabase/migrations/.
+-- Aplicar pela ordem apresentada. Gerado em 2026-07-27.
+
+
+-- ================================================================
+-- FICHEIRO: 001_extensions.sql
+-- ================================================================
+
+-- 001_extensions.sql — extensões e configuração base
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "btree_gist";   -- EXCLUDE com UUID e int4
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";     -- gen_random_bytes + digest (tokens)
+
+ALTER DATABASE postgres SET timezone TO 'America/Sao_Paulo';
+SET TIME ZONE 'America/Sao_Paulo';
+
+-- Wrappers determinísticos de cripto — as RPCs correm com search_path='' (anti-hijack)
+-- e chamam SEMPRE estes wrappers do nosso schema, nunca as funções da extensão diretamente.
+-- (a extensão pode viver em public ou em extensions, conforme o ambiente Supabase)
+CREATE OR REPLACE FUNCTION public.gerar_token_opaco()
+RETURNS TEXT
+LANGUAGE sql VOLATILE SET search_path = public, extensions AS $$
+    SELECT encode(gen_random_bytes(32), 'hex');
+$$;
+
+CREATE OR REPLACE FUNCTION public.sha256_hex(valor TEXT)
+RETURNS TEXT
+LANGUAGE sql IMMUTABLE SET search_path = public, extensions AS $$
+    SELECT encode(digest(valor, 'sha256'), 'hex');
+$$;
+
+
+-- ================================================================
+-- FICHEIRO: 002_core.sql
+-- ================================================================
+
+-- 002_core.sql — empresas, recursos físicos, profissionais, usuários, logs e comunicação
+
+CREATE TABLE empresas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    nome TEXT NOT NULL,
+    cnpj TEXT UNIQUE,              -- TODO: substituir placeholder pelo CNPJ real
+    telefone TEXT,
+    endereco TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE tipos_recurso (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome TEXT NOT NULL,
+    descricao TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    UNIQUE(empresa_id, nome)
+);
+
+CREATE TABLE recursos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    tipo_recurso_id UUID NOT NULL REFERENCES tipos_recurso(id),
+    nome TEXT NOT NULL,
+    ativo BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    FOREIGN KEY (tipo_recurso_id, empresa_id) REFERENCES tipos_recurso(id, empresa_id)
+);
+
+CREATE TABLE profissionais (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome TEXT NOT NULL,
+    foto_url TEXT,
+    bio TEXT,
+    ativo BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id)
+);
+
+-- UNIQUE(id, empresa_id) permite FKs compostas de inquilino (Ricardo: cruzamento entre empresas)
+CREATE TABLE usuarios_internos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    auth_user_id UUID NOT NULL UNIQUE REFERENCES auth.users(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    email TEXT NOT NULL,
+    nome TEXT NOT NULL,
+    perfil TEXT NOT NULL CHECK (perfil IN ('admin', 'gestor', 'recepcao', 'profissional')),
+    ativo BOOLEAN DEFAULT true,
+    mfa_ativado BOOLEAN DEFAULT false,
+    convite_por UUID REFERENCES usuarios_internos(id),
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id)
+);
+
+CREATE TABLE usuario_profissional (
+    usuario_id UUID PRIMARY KEY REFERENCES usuarios_internos(id),
+    profissional_id UUID UNIQUE REFERENCES profissionais(id)
+);
+
+-- v3.3: impede ligar usuário da empresa A a profissional da empresa B
+CREATE OR REPLACE FUNCTION validar_usuario_profissional_mesma_empresa()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.usuarios_internos u
+        JOIN public.profissionais p ON p.empresa_id = u.empresa_id
+        WHERE u.id = NEW.usuario_id AND p.id = NEW.profissional_id
+    ) THEN
+        RAISE EXCEPTION 'Usuário e profissional pertencem a empresas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_up_mesma_empresa
+BEFORE INSERT OR UPDATE ON usuario_profissional
+FOR EACH ROW EXECUTE FUNCTION validar_usuario_profissional_mesma_empresa();
+
+CREATE TABLE log_acoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    tabela TEXT NOT NULL,
+    registro_id UUID NOT NULL,
+    acao TEXT NOT NULL CHECK (acao IN ('INSERT', 'UPDATE', 'DELETE')),
+    usuario_id UUID REFERENCES usuarios_internos(id),
+    perfil TEXT,
+    campos_alterados JSONB,
+    motivo TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE log_acoes_sensiveis (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    tabela TEXT NOT NULL,
+    registro_id UUID NOT NULL,
+    acao TEXT NOT NULL,
+    usuario_id UUID REFERENCES usuarios_internos(id),
+    apenas_metadados JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE templates_mensagem (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    canal TEXT NOT NULL CHECK (canal IN ('whatsapp', 'email', 'sms')),
+    tipo TEXT NOT NULL,
+    segmento TEXT CHECK (segmento IN ('feminino', 'masculino', 'todos')),
+    assunto TEXT,
+    corpo TEXT NOT NULL,
+    ativo BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE conversas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    cliente_id UUID NOT NULL,
+    canal TEXT NOT NULL CHECK (canal IN ('whatsapp', 'instagram', 'messenger')),
+    estado TEXT NOT NULL CHECK (estado IN ('ativa', 'transbordada', 'fechada')) DEFAULT 'ativa',
+    transbordada_para UUID REFERENCES usuarios_internos(id),
+    motivo_transbordo TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id)
+);
+-- FK de clientes adicionada em 006 (clientes nasce em 003 dependências circulares evitadas via ALTER)
+
+CREATE TABLE mensagens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversa_id UUID NOT NULL REFERENCES conversas(id),
+    origem TEXT NOT NULL CHECK (origem IN ('cliente', 'bot', 'humano')),
+    conteudo TEXT NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE transbordos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversa_id UUID NOT NULL REFERENCES conversas(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    motivo TEXT NOT NULL,
+    resumo_conversa TEXT NOT NULL,
+    ponto_trava TEXT NOT NULL,
+    profissional_id UUID NOT NULL REFERENCES profissionais(id),
+    atendido BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    FOREIGN KEY (conversa_id, empresa_id) REFERENCES conversas(id, empresa_id),
+    FOREIGN KEY (profissional_id, empresa_id) REFERENCES profissionais(id, empresa_id)
+);
+
+
+-- ================================================================
+-- FICHEIRO: 003_catalog.sql
+-- ================================================================
+
+-- 003_catalog.sql — clientes, anamnese (modelos), serviços, cardápios, habilitações, pacotes (modelos)
+
+CREATE TABLE clientes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome TEXT NOT NULL,
+    telefone_normalizado TEXT NOT NULL,
+    email TEXT,
+    data_nascimento DATE,
+    cidade TEXT,
+    como_conheceu TEXT,
+    segmento_preferido TEXT CHECK (segmento_preferido IN ('feminino', 'masculino', 'nao_definido')) DEFAULT 'nao_definido',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    UNIQUE(empresa_id, telefone_normalizado)
+);
+
+-- FK adiada de 002 (conversas → clientes)
+ALTER TABLE conversas
+ADD CONSTRAINT fk_conversas_cliente_empresa
+FOREIGN KEY (cliente_id, empresa_id) REFERENCES clientes(id, empresa_id);
+
+CREATE TABLE modelos_anamnese (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome TEXT NOT NULL,
+    versao INT NOT NULL DEFAULT 1,
+    ativo BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id)
+);
+
+CREATE TABLE modelo_perguntas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    modelo_id UUID NOT NULL REFERENCES modelos_anamnese(id),
+    ordem INT NOT NULL,
+    pergunta TEXT NOT NULL,
+    tipo_resposta TEXT NOT NULL CHECK (tipo_resposta IN ('sim_nao', 'texto', 'multipla_escolha', 'numero')),
+    opcoes JSONB,
+    obrigatoria BOOLEAN DEFAULT true,
+    operador TEXT CHECK (operador IN ('igual', 'diferente', 'contem', 'maior_que', 'menor_que')),
+    valor_disparador TEXT,
+    resultado_estado TEXT CHECK (resultado_estado IN ('liberada', 'requer_avaliacao')),
+    UNIQUE(modelo_id, ordem)
+);
+
+CREATE TABLE servicos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome_tecnico TEXT NOT NULL,
+    tipo_recurso_id UUID NOT NULL REFERENCES tipos_recurso(id),
+    duracao_minutos INT NOT NULL CHECK (duracao_minutos > 0),
+    preco_base DECIMAL(10,2) NOT NULL CHECK (preco_base >= 0),
+    percentual_sinal INT NOT NULL DEFAULT 30 CHECK (percentual_sinal BETWEEN 0 AND 100),
+    anamnese_obrigatoria BOOLEAN DEFAULT true,
+    modelo_anamnese_id UUID REFERENCES modelos_anamnese(id),
+    ativo BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    FOREIGN KEY (tipo_recurso_id, empresa_id) REFERENCES tipos_recurso(id, empresa_id),
+    -- v3.3: modelo de anamnese tem de ser da mesma empresa
+    FOREIGN KEY (modelo_anamnese_id, empresa_id) REFERENCES modelos_anamnese(id, empresa_id),
+    UNIQUE(empresa_id, nome_tecnico)
+);
+
+CREATE TABLE servico_cardapios (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    cardapio TEXT NOT NULL CHECK (cardapio IN ('feminino', 'masculino')),
+    nome_comercial TEXT NOT NULL,
+    descricao TEXT,
+    preco_final DECIMAL(10,2),
+    ativo BOOLEAN DEFAULT true,
+    UNIQUE(servico_id, cardapio)
+);
+
+-- v3.3: empresa_id explícito — impedia-se habilitação cruzada entre empresas
+CREATE TABLE profissional_servicos (
+    profissional_id UUID NOT NULL REFERENCES profissionais(id),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    PRIMARY KEY (profissional_id, servico_id),
+    FOREIGN KEY (profissional_id, empresa_id) REFERENCES profissionais(id, empresa_id),
+    FOREIGN KEY (servico_id, empresa_id) REFERENCES servicos(id, empresa_id)
+);
+
+CREATE TABLE modelos_pacote (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome TEXT NOT NULL,
+    descricao TEXT,
+    preco DECIMAL(10,2) NOT NULL,
+    validade_dias INT NOT NULL,
+    ativo BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id)
+);
+
+-- v3.3: empresa_id explícito + FKs compostas
+CREATE TABLE modelo_pacote_itens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pacote_id UUID NOT NULL REFERENCES modelos_pacote(id),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    quantidade INT NOT NULL CHECK (quantidade > 0),
+    UNIQUE(pacote_id, servico_id),
+    FOREIGN KEY (pacote_id, empresa_id) REFERENCES modelos_pacote(id, empresa_id),
+    FOREIGN KEY (servico_id, empresa_id) REFERENCES servicos(id, empresa_id)
+);
+
+
+-- ================================================================
+-- FICHEIRO: 004_schedule.sql
+-- ================================================================
+
+-- 004_schedule.sql — horários multi-intervalo (almoço!), exceções, ocupações e bloqueios
+
+-- v3.3 (Ricardo #7): vários intervalos por dia — 09:00–12:30 e 13:30–17:00.
+-- O UNIQUE(profissional_id, dia_semana) foi substituído por EXCLUDE de sobreposição.
+CREATE TABLE horarios_empresa (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    dia_semana INT NOT NULL CHECK (dia_semana BETWEEN 0 AND 6), -- 0=domingo
+    abertura TIME NOT NULL,
+    fechamento TIME NOT NULL,
+    ativo BOOLEAN DEFAULT true,
+    intervalo INT4RANGE GENERATED ALWAYS AS (
+        int4range((EXTRACT(EPOCH FROM abertura)/60)::INT, (EXTRACT(EPOCH FROM fechamento)/60)::INT, '[)')
+    ) STORED,
+    CHECK (abertura < fechamento)
+);
+
+ALTER TABLE horarios_empresa
+ADD CONSTRAINT excl_hor_empresa_overlap
+EXCLUDE USING gist (empresa_id WITH =, dia_semana WITH =, intervalo WITH &&)
+WHERE (ativo = true);
+
+CREATE TABLE horarios_profissional (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profissional_id UUID NOT NULL REFERENCES profissionais(id),
+    dia_semana INT NOT NULL CHECK (dia_semana BETWEEN 0 AND 6),
+    abertura TIME NOT NULL,
+    fechamento TIME NOT NULL,
+    ativo BOOLEAN DEFAULT true,
+    intervalo INT4RANGE GENERATED ALWAYS AS (
+        int4range((EXTRACT(EPOCH FROM abertura)/60)::INT, (EXTRACT(EPOCH FROM fechamento)/60)::INT, '[)')
+    ) STORED,
+    CHECK (abertura < fechamento)
+);
+
+ALTER TABLE horarios_profissional
+ADD CONSTRAINT excl_hor_prof_overlap
+EXCLUDE USING gist (profissional_id WITH =, dia_semana WITH =, intervalo WITH &&)
+WHERE (ativo = true);
+
+CREATE TABLE excecoes_calendario (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    profissional_id UUID REFERENCES profissionais(id), -- NULL = toda a empresa
+    data DATE NOT NULL,
+    tipo TEXT NOT NULL CHECK (tipo IN ('folga', 'feriado', 'ajuste')),
+    abertura TIME,
+    fechamento TIME,
+    motivo TEXT,
+    FOREIGN KEY (profissional_id, empresa_id) REFERENCES profissionais(id, empresa_id)
+);
+
+CREATE UNIQUE INDEX uq_excecao_profissional_data
+    ON excecoes_calendario (profissional_id, data) WHERE profissional_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_excecao_empresa_data
+    ON excecoes_calendario (empresa_id, data) WHERE profissional_id IS NULL;
+
+-- Ocupações. v3.3 (Ricardo #11): reserva_item_id identifica qual serviço ocupa o slot
+-- (FK adicionada em 006, quando reserva_itens já existe)
+CREATE TABLE agenda_ocupacoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    tipo_ocupacao TEXT NOT NULL CHECK (tipo_ocupacao IN ('profissional', 'recurso')),
+    profissional_id UUID REFERENCES profissionais(id),
+    recurso_id UUID REFERENCES recursos(id),
+    reserva_item_id UUID,                     -- NOVO v3.3
+    inicio TIMESTAMPTZ NOT NULL,
+    fim TIMESTAMPTZ NOT NULL,
+    periodo TSTZRANGE GENERATED ALWAYS AS (tstzrange(inicio, fim, '[)')) STORED,
+    origem TEXT NOT NULL CHECK (origem IN ('reserva', 'bloqueio', 'pre_reserva')),
+    origem_id UUID,
+    estado TEXT NOT NULL CHECK (estado IN ('ativa', 'cancelada', 'expirada')) DEFAULT 'ativa',
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    CHECK (inicio < fim),
+    CHECK (
+        (tipo_ocupacao = 'profissional' AND profissional_id IS NOT NULL AND recurso_id IS NULL) OR
+        (tipo_ocupacao = 'recurso' AND recurso_id IS NOT NULL AND profissional_id IS NULL)
+    ),
+    FOREIGN KEY (profissional_id, empresa_id) REFERENCES profissionais(id, empresa_id),
+    FOREIGN KEY (recurso_id, empresa_id) REFERENCES recursos(id, empresa_id)
+);
+
+CREATE INDEX idx_ocupacoes_empresa ON agenda_ocupacoes(empresa_id);
+CREATE INDEX idx_ocupacoes_origem ON agenda_ocupacoes(origem, origem_id);
+CREATE INDEX idx_ocupacoes_item ON agenda_ocupacoes(reserva_item_id);
+
+ALTER TABLE agenda_ocupacoes
+ADD CONSTRAINT exclude_profissional_conflito
+EXCLUDE USING gist (profissional_id WITH =, periodo WITH &&)
+WHERE (estado = 'ativa' AND profissional_id IS NOT NULL);
+
+ALTER TABLE agenda_ocupacoes
+ADD CONSTRAINT exclude_recurso_conflito
+EXCLUDE USING gist (recurso_id WITH =, periodo WITH &&)
+WHERE (estado = 'ativa' AND recurso_id IS NOT NULL);
+
+-- Bloqueios. v3.3: triggers SECURITY DEFINER — sobrevivem ao REVOKE de UPDATE(estado) (007)
+CREATE TABLE bloqueios (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    profissional_id UUID NOT NULL REFERENCES profissionais(id),
+    recurso_id UUID REFERENCES recursos(id),
+    inicio TIMESTAMPTZ NOT NULL,
+    fim TIMESTAMPTZ NOT NULL,
+    motivo TEXT NOT NULL,
+    tipo TEXT NOT NULL CHECK (tipo IN ('almoco', 'folga', 'imprevisto')),
+    created_at TIMESTAMPTZ DEFAULT now(),
+    CHECK (inicio < fim),
+    FOREIGN KEY (profissional_id, empresa_id) REFERENCES profissionais(id, empresa_id),
+    FOREIGN KEY (recurso_id, empresa_id) REFERENCES recursos(id, empresa_id)
+);
+
+CREATE OR REPLACE FUNCTION sincronizar_bloqueio_ocupacoes()
+RETURNS TRIGGER
+SECURITY DEFINER SET search_path = ''
+AS $$
+BEGIN
+    INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, profissional_id, inicio, fim, origem, origem_id, estado)
+    VALUES (NEW.empresa_id, 'profissional', NEW.profissional_id, NEW.inicio, NEW.fim, 'bloqueio', NEW.id, 'ativa');
+
+    IF NEW.recurso_id IS NOT NULL THEN
+        INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, recurso_id, inicio, fim, origem, origem_id, estado)
+        VALUES (NEW.empresa_id, 'recurso', NEW.recurso_id, NEW.inicio, NEW.fim, 'bloqueio', NEW.id, 'ativa');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_bloqueio_cria_ocupacoes
+AFTER INSERT ON bloqueios
+FOR EACH ROW EXECUTE FUNCTION sincronizar_bloqueio_ocupacoes();
+
+CREATE OR REPLACE FUNCTION atualizar_bloqueio_ocupacoes()
+RETURNS TRIGGER
+SECURITY DEFINER SET search_path = ''
+AS $$
+BEGIN
+    -- Mudança de profissional: cancela a ocupação antiga e cria a nova (Carlos #10)
+    IF OLD.profissional_id IS DISTINCT FROM NEW.profissional_id THEN
+        UPDATE public.agenda_ocupacoes SET estado = 'cancelada'
+        WHERE origem = 'bloqueio' AND origem_id = NEW.id
+          AND tipo_ocupacao = 'profissional' AND estado = 'ativa';
+        INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, profissional_id, inicio, fim, origem, origem_id, estado)
+        VALUES (NEW.empresa_id, 'profissional', NEW.profissional_id, NEW.inicio, NEW.fim, 'bloqueio', NEW.id, 'ativa');
+    ELSE
+        UPDATE public.agenda_ocupacoes
+        SET inicio = NEW.inicio, fim = NEW.fim
+        WHERE origem = 'bloqueio' AND origem_id = NEW.id
+          AND tipo_ocupacao = 'profissional' AND estado = 'ativa';
+    END IF;
+
+    IF OLD.recurso_id IS NOT NULL AND NEW.recurso_id IS NULL THEN
+        UPDATE public.agenda_ocupacoes SET estado = 'cancelada'
+        WHERE origem = 'bloqueio' AND origem_id = NEW.id
+          AND tipo_ocupacao = 'recurso' AND estado = 'ativa';
+    ELSIF OLD.recurso_id IS NULL AND NEW.recurso_id IS NOT NULL THEN
+        INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, recurso_id, inicio, fim, origem, origem_id, estado)
+        VALUES (NEW.empresa_id, 'recurso', NEW.recurso_id, NEW.inicio, NEW.fim, 'bloqueio', NEW.id, 'ativa');
+    ELSIF OLD.recurso_id IS NOT NULL AND NEW.recurso_id IS NOT NULL THEN
+        UPDATE public.agenda_ocupacoes
+        SET inicio = NEW.inicio, fim = NEW.fim, recurso_id = NEW.recurso_id
+        WHERE origem = 'bloqueio' AND origem_id = NEW.id
+          AND tipo_ocupacao = 'recurso' AND estado = 'ativa';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_bloqueio_atualiza_ocupacoes
+AFTER UPDATE ON bloqueios
+FOR EACH ROW EXECUTE FUNCTION atualizar_bloqueio_ocupacoes();
+
+CREATE OR REPLACE FUNCTION remover_bloqueio_ocupacoes()
+RETURNS TRIGGER
+SECURITY DEFINER SET search_path = ''
+AS $$
+BEGIN
+    UPDATE public.agenda_ocupacoes SET estado = 'cancelada'
+    WHERE origem = 'bloqueio' AND origem_id = OLD.id AND estado = 'ativa';
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_bloqueio_remove_ocupacoes
+AFTER DELETE ON bloqueios
+FOR EACH ROW EXECUTE FUNCTION remover_bloqueio_ocupacoes();
+
+
+-- ================================================================
+-- FICHEIRO: 005_anamnesis.sql
+-- ================================================================
+
+-- 005_anamnesis.sql — fichas de anamnese e respostas
+-- (anamnese_tokens nasce em 006 porque referencia reservas)
+
+CREATE TABLE anamneses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    cliente_id UUID NOT NULL REFERENCES clientes(id),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    modelo_id UUID NOT NULL REFERENCES modelos_anamnese(id),
+    versao_modelo INT NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('pendente', 'liberada', 'requer_avaliacao')) DEFAULT 'pendente',
+    reserva_item_id UUID,               -- FK adicionada em 006 (reserva_itens nasce lá)
+    profissional_revisora_id UUID REFERENCES profissionais(id),
+    data_revisao TIMESTAMPTZ,
+    consentimento_lgpd BOOLEAN DEFAULT false,
+    texto_consentimento_aceito TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    FOREIGN KEY (cliente_id, empresa_id) REFERENCES clientes(id, empresa_id),
+    FOREIGN KEY (servico_id, empresa_id) REFERENCES servicos(id, empresa_id),
+    FOREIGN KEY (modelo_id, empresa_id) REFERENCES modelos_anamnese(id, empresa_id),
+    FOREIGN KEY (profissional_revisora_id, empresa_id) REFERENCES profissionais(id, empresa_id)
+);
+
+CREATE TABLE anamnese_respostas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    anamnese_id UUID NOT NULL REFERENCES anamneses(id),
+    pergunta_id UUID NOT NULL REFERENCES modelo_perguntas(id),
+    resposta TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(anamnese_id, pergunta_id)
+);
+
+-- v3.3: resposta não pode ligar anamnese da empresa A com pergunta de modelo da empresa B
+CREATE OR REPLACE FUNCTION validar_resposta_mesma_empresa()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.anamneses a
+        JOIN public.modelo_perguntas mp ON mp.id = NEW.pergunta_id
+        JOIN public.modelos_anamnese m ON m.id = mp.modelo_id AND m.empresa_id = a.empresa_id
+        WHERE a.id = NEW.anamnese_id
+    ) THEN
+        RAISE EXCEPTION 'Pergunta e anamnese pertencem a empresas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_resposta_mesma_empresa
+BEFORE INSERT OR UPDATE ON anamnese_respostas
+FOR EACH ROW EXECUTE FUNCTION validar_resposta_mesma_empresa();
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_anamneses_updated_at BEFORE UPDATE ON anamneses
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+
+-- ================================================================
+-- FICHEIRO: 006_payments.sql
+-- ================================================================
+
+-- 006_payments.sql — reservas, itens, pagamentos, créditos, pacotes, cartões, tokens, infra
+
+-- v3.3 (Ricardo #3): idempotência POR EMPRESA — a mesma chave nunca devolve reserva de outra empresa
+CREATE TABLE reservas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    cliente_id UUID NOT NULL REFERENCES clientes(id),
+    -- v3.4: 'expirada' — pré-reserva cujo prazo de 30 min passou sem pagamento (Ricardo/Carlos)
+    estado TEXT NOT NULL CHECK (estado IN ('pre_reserva', 'expirada', 'pagamento_em_revisao', 'confirmada', 'realizada', 'cancelada', 'no_show')) DEFAULT 'pre_reserva',
+    valor_total DECIMAL(10,2),
+    percentual_sinal INT NOT NULL DEFAULT 30,
+    valor_sinal_total DECIMAL(10,2),
+    idempotencia_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    UNIQUE(empresa_id, idempotencia_key),
+    FOREIGN KEY (cliente_id, empresa_id) REFERENCES clientes(id, empresa_id)
+);
+
+CREATE TRIGGER trg_reservas_updated_at BEFORE UPDATE ON reservas
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE reserva_itens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reserva_id UUID NOT NULL REFERENCES reservas(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    nome_servico TEXT NOT NULL,
+    preco_base_utilizado DECIMAL(10,2) NOT NULL,
+    preco_final DECIMAL(10,2),
+    duracao_reservada INT NOT NULL CHECK (duracao_reservada > 0),
+    percentual_sinal INT NOT NULL DEFAULT 30,
+    valor_sinal DECIMAL(10,2) NOT NULL,
+    servico_id UUID REFERENCES servicos(id),
+    profissional_id UUID NOT NULL REFERENCES profissionais(id),
+    recurso_id UUID NOT NULL REFERENCES recursos(id),
+    inicio TIMESTAMPTZ NOT NULL,
+    fim TIMESTAMPTZ NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('pendente', 'confirmado', 'realizado', 'cancelado')) DEFAULT 'pendente',
+    observacoes TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    CHECK (inicio < fim),
+    FOREIGN KEY (reserva_id, empresa_id) REFERENCES reservas(id, empresa_id),
+    FOREIGN KEY (servico_id, empresa_id) REFERENCES servicos(id, empresa_id),
+    FOREIGN KEY (profissional_id, empresa_id) REFERENCES profissionais(id, empresa_id),
+    FOREIGN KEY (recurso_id, empresa_id) REFERENCES recursos(id, empresa_id)
+);
+
+-- Validação recurso×serviço via trigger (subquery em CHECK não existe em PostgreSQL)
+CREATE OR REPLACE FUNCTION validar_recurso_compativel()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.servico_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM public.servicos s
+        JOIN public.recursos r ON r.id = NEW.recurso_id
+        WHERE s.id = NEW.servico_id AND r.tipo_recurso_id = s.tipo_recurso_id
+    ) THEN
+        RAISE EXCEPTION 'Recurso % não é do tipo exigido pelo serviço %', NEW.recurso_id, NEW.servico_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_valida_recurso_compativel
+BEFORE INSERT OR UPDATE ON reserva_itens
+FOR EACH ROW EXECUTE FUNCTION validar_recurso_compativel();
+
+-- v3.3 (Ricardo #11): FK da ocupação → item da reserva (cancelamento individual)
+ALTER TABLE agenda_ocupacoes
+ADD CONSTRAINT fk_ocupacao_reserva_item
+FOREIGN KEY (reserva_item_id) REFERENCES reserva_itens(id);
+
+-- v3.4 (Carlos #11): a ficha de anamnese sabe QUAL o item de reserva que a originou
+ALTER TABLE anamneses
+ADD CONSTRAINT fk_anamnese_reserva_item
+FOREIGN KEY (reserva_item_id) REFERENCES reserva_itens(id);
+
+-- Máquina de estados enforced por trigger
+CREATE OR REPLACE FUNCTION validar_transicao_reserva()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.estado IS NOT DISTINCT FROM NEW.estado THEN RETURN NEW; END IF;
+    IF NOT (
+        (OLD.estado = 'pre_reserva' AND NEW.estado IN ('confirmada', 'cancelada', 'pagamento_em_revisao', 'expirada')) OR
+        (OLD.estado = 'expirada' AND NEW.estado IN ('pagamento_em_revisao', 'cancelada')) OR
+        (OLD.estado = 'pagamento_em_revisao' AND NEW.estado IN ('confirmada', 'cancelada')) OR
+        (OLD.estado = 'confirmada' AND NEW.estado IN ('realizada', 'cancelada', 'no_show'))
+    ) THEN
+        RAISE EXCEPTION 'Transição inválida em reservas: % → %', OLD.estado, NEW.estado;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_reservas_estado BEFORE UPDATE OF estado ON reservas
+FOR EACH ROW EXECUTE FUNCTION validar_transicao_reserva();
+
+CREATE OR REPLACE FUNCTION validar_transicao_reserva_item()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.estado IS NOT DISTINCT FROM NEW.estado THEN RETURN NEW; END IF;
+    IF NOT (
+        (OLD.estado = 'pendente' AND NEW.estado IN ('confirmado', 'cancelado')) OR
+        (OLD.estado = 'confirmado' AND NEW.estado IN ('realizado', 'cancelado')) OR
+        -- v3.4.1: resolver_revisao('confirmar') revive itens cancelados pelo cron
+        (OLD.estado = 'cancelado' AND NEW.estado = 'confirmado')
+    ) THEN
+        RAISE EXCEPTION 'Transição inválida em reserva_itens: % → %', OLD.estado, NEW.estado;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_reserva_itens_estado BEFORE UPDATE OF estado ON reserva_itens
+FOR EACH ROW EXECUTE FUNCTION validar_transicao_reserva_item();
+
+CREATE OR REPLACE FUNCTION validar_transicao_ocupacao()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.estado IS NOT DISTINCT FROM NEW.estado THEN RETURN NEW; END IF;
+    IF NOT (OLD.estado = 'ativa' AND NEW.estado IN ('cancelada', 'expirada')) THEN
+        RAISE EXCEPTION 'Transição inválida em agenda_ocupacoes: % → %', OLD.estado, NEW.estado;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ocupacoes_estado BEFORE UPDATE OF estado ON agenda_ocupacoes
+FOR EACH ROW EXECUTE FUNCTION validar_transicao_ocupacao();
+
+CREATE TABLE cobrancas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reserva_id UUID NOT NULL REFERENCES reservas(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    valor_total DECIMAL(10,2) NOT NULL CHECK (valor_total >= 0),
+    percentual_sinal INT NOT NULL DEFAULT 30,
+    valor_sinal DECIMAL(10,2) NOT NULL CHECK (valor_sinal >= 0),
+    UNIQUE(reserva_id),
+    estado TEXT NOT NULL CHECK (estado IN ('pendente', 'sinal_pago', 'total_pago', 'cancelada')) DEFAULT 'pendente',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    FOREIGN KEY (reserva_id, empresa_id) REFERENCES reservas(id, empresa_id)
+);
+
+CREATE TABLE transacoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cobranca_id UUID NOT NULL REFERENCES cobrancas(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    mp_idempotency_key TEXT NOT NULL UNIQUE,
+    mp_transaction_id TEXT UNIQUE,
+    valor DECIMAL(10,2) NOT NULL CHECK (valor > 0),
+    meio TEXT NOT NULL CHECK (meio IN ('pix', 'dinheiro', 'cartao_debito', 'cartao_credito')),
+    finalidade TEXT NOT NULL CHECK (finalidade IN ('sinal', 'saldo', 'pagamento_total', 'estorno')),
+    estado TEXT NOT NULL CHECK (estado IN ('pendente', 'pago', 'expirado', 'estornado')) DEFAULT 'pendente',
+    payload_webhook JSONB,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    FOREIGN KEY (cobranca_id, empresa_id) REFERENCES cobrancas(id, empresa_id)
+);
+
+CREATE UNIQUE INDEX idx_transacao_sinal_pago_unico
+ON transacoes (cobranca_id)
+WHERE finalidade = 'sinal' AND estado = 'pago';
+
+CREATE TABLE eventos_pagamento (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transacao_id UUID REFERENCES transacoes(id),
+    mp_event_id TEXT NOT NULL UNIQUE,
+    tipo_evento TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    processado BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE alocacoes_pagamento (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transacao_id UUID NOT NULL REFERENCES transacoes(id),
+    reserva_item_id UUID NOT NULL REFERENCES reserva_itens(id),
+    valor_alocado DECIMAL(10,2) NOT NULL CHECK (valor_alocado > 0)
+);
+
+-- v3.3: alocação não pode cruzar empresas
+CREATE OR REPLACE FUNCTION validar_alocacao_mesma_empresa()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.transacoes t
+        JOIN public.reserva_itens ri ON ri.empresa_id = t.empresa_id
+        WHERE t.id = NEW.transacao_id AND ri.id = NEW.reserva_item_id
+    ) THEN
+        RAISE EXCEPTION 'Transação e item pertencem a empresas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_alocacao_mesma_empresa
+BEFORE INSERT OR UPDATE ON alocacoes_pagamento
+FOR EACH ROW EXECUTE FUNCTION validar_alocacao_mesma_empresa();
+
+-- Créditos
+CREATE TABLE contas_creditos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cliente_id UUID NOT NULL REFERENCES clientes(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    tipo TEXT NOT NULL CHECK (tipo IN ('pago', 'promocional')),
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    UNIQUE(cliente_id, empresa_id, tipo),
+    FOREIGN KEY (cliente_id, empresa_id) REFERENCES clientes(id, empresa_id)
+);
+
+CREATE TABLE lancamentos_creditos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conta_id UUID NOT NULL REFERENCES contas_creditos(id),
+    tipo_lancamento TEXT NOT NULL CHECK (tipo_lancamento IN (
+        'emissao_pacote', 'credito_cancelamento', 'beneficio_promocional',
+        'consumo', 'expiracao', 'ajuste_admin', 'estorno'
+    )),
+    valor DECIMAL(10,2) NOT NULL,
+    saldo_apos DECIMAL(10,2) NOT NULL,
+    idempotencia_key TEXT NOT NULL UNIQUE,
+    origem_id UUID,
+    origem_tipo TEXT,
+    validade DATE,
+    observacoes TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE credito_servicos_permitidos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    lancamento_id UUID NOT NULL REFERENCES lancamentos_creditos(id),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    UNIQUE(lancamento_id, servico_id)
+);
+
+-- v3.3: serviço permitido tem de ser da empresa da conta de crédito
+CREATE OR REPLACE FUNCTION validar_credito_servico_mesma_empresa()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.lancamentos_creditos l
+        JOIN public.contas_creditos c ON c.id = l.conta_id
+        JOIN public.servicos s ON s.empresa_id = c.empresa_id
+        WHERE l.id = NEW.lancamento_id AND s.id = NEW.servico_id
+    ) THEN
+        RAISE EXCEPTION 'Serviço e lançamento pertencem a empresas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_credito_servico_mesma_empresa
+BEFORE INSERT OR UPDATE ON credito_servicos_permitidos
+FOR EACH ROW EXECUTE FUNCTION validar_credito_servico_mesma_empresa();
+
+-- Pacotes (compras — modelos estão em 003)
+CREATE TABLE compras_pacote (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    cliente_id UUID NOT NULL REFERENCES clientes(id),
+    modelo_id UUID NOT NULL REFERENCES modelos_pacote(id),
+    preco_pago DECIMAL(10,2) NOT NULL,
+    validade DATE NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('ativo', 'expirado', 'cancelado')) DEFAULT 'ativo',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(id, empresa_id),
+    FOREIGN KEY (cliente_id, empresa_id) REFERENCES clientes(id, empresa_id),
+    FOREIGN KEY (modelo_id, empresa_id) REFERENCES modelos_pacote(id, empresa_id)
+);
+
+CREATE TABLE compra_pacote_itens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    compra_id UUID NOT NULL REFERENCES compras_pacote(id),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    nome_servico TEXT NOT NULL,
+    quantidade_total INT NOT NULL,
+    quantidade_utilizada INT NOT NULL DEFAULT 0,
+    UNIQUE(compra_id, servico_id)
+);
+
+CREATE OR REPLACE FUNCTION validar_compra_item_mesma_empresa()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.compras_pacote cp
+        JOIN public.servicos s ON s.empresa_id = cp.empresa_id
+        WHERE cp.id = NEW.compra_id AND s.id = NEW.servico_id
+    ) THEN
+        RAISE EXCEPTION 'Serviço e compra pertencem a empresas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_compra_item_mesma_empresa
+BEFORE INSERT OR UPDATE ON compra_pacote_itens
+FOR EACH ROW EXECUTE FUNCTION validar_compra_item_mesma_empresa();
+
+CREATE TABLE pacote_utilizacoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    compra_id UUID NOT NULL REFERENCES compras_pacote(id),
+    reserva_item_id UUID REFERENCES reserva_itens(id),
+    servico_id UUID NOT NULL REFERENCES servicos(id),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION validar_utilizacao_mesma_empresa()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM public.compras_pacote cp
+        JOIN public.servicos s ON s.empresa_id = cp.empresa_id
+        WHERE cp.id = NEW.compra_id AND s.id = NEW.servico_id
+    ) THEN
+        RAISE EXCEPTION 'Serviço e compra pertencem a empresas diferentes';
+    END IF;
+    IF NEW.reserva_item_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM public.compras_pacote cp
+        JOIN public.reserva_itens ri ON ri.empresa_id = cp.empresa_id
+        WHERE cp.id = NEW.compra_id AND ri.id = NEW.reserva_item_id
+    ) THEN
+        RAISE EXCEPTION 'Item de reserva e compra pertencem a empresas diferentes';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_utilizacao_mesma_empresa
+BEFORE INSERT OR UPDATE ON pacote_utilizacoes
+FOR EACH ROW EXECUTE FUNCTION validar_utilizacao_mesma_empresa();
+
+-- Cartões-presente (v3.3: FKs compostas de comprador/beneficiário)
+CREATE TABLE cartoes_presente (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    codigo TEXT NOT NULL UNIQUE,
+    valor_original DECIMAL(10,2) NOT NULL,
+    saldo DECIMAL(10,2) NOT NULL,
+    comprador_id UUID REFERENCES clientes(id),
+    beneficiario_id UUID REFERENCES clientes(id),
+    validade DATE NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('ativo', 'utilizado', 'expirado', 'cancelado')) DEFAULT 'ativo',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    FOREIGN KEY (comprador_id, empresa_id) REFERENCES clientes(id, empresa_id),
+    FOREIGN KEY (beneficiario_id, empresa_id) REFERENCES clientes(id, empresa_id)
+);
+
+CREATE TABLE cartao_presente_lancamentos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cartao_id UUID NOT NULL REFERENCES cartoes_presente(id),
+    tipo TEXT NOT NULL CHECK (tipo IN ('compra', 'utilizacao', 'expiracao', 'cancelamento')),
+    valor DECIMAL(10,2) NOT NULL,
+    saldo_apos DECIMAL(10,2) NOT NULL,
+    reserva_id UUID REFERENCES reservas(id),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Revisões de cancelamento (v3.3: decidido_por composto — sem cruzamento)
+CREATE TABLE revisoes_cancelamento (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reserva_id UUID NOT NULL REFERENCES reservas(id),
+    reserva_item_id UUID REFERENCES reserva_itens(id),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    valor_sinal DECIMAL(10,2) NOT NULL,
+    -- v3.4: 'pagamento_atrasado' — sinal pago depois do prazo (Carlos #4); decisão 'confirmar' reagenda o slot
+    regra_aplicada TEXT NOT NULL CHECK (regra_aplicada IN ('credito_automatico', 'perda_automatica', 'pagamento_atrasado')),
+    decisao_final TEXT CHECK (decisao_final IN ('credito', 'estorno', 'perdido', 'confirmar')),
+    decidido_por UUID REFERENCES usuarios_internos(id),
+    motivo_decisao TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    FOREIGN KEY (reserva_id, empresa_id) REFERENCES reservas(id, empresa_id),
+    FOREIGN KEY (decidido_por, empresa_id) REFERENCES usuarios_internos(id, empresa_id)
+);
+
+-- Uma única revisão ABERTA por reserva e por item
+CREATE UNIQUE INDEX uq_revisao_aberta_reserva ON revisoes_cancelamento (reserva_id)
+WHERE decisao_final IS NULL AND reserva_item_id IS NULL;
+CREATE UNIQUE INDEX uq_revisao_aberta_item ON revisoes_cancelamento (reserva_item_id)
+WHERE decisao_final IS NULL AND reserva_item_id IS NOT NULL;
+
+-- Tokens de anamnese (aqui porque referenciam reservas)
+CREATE TABLE anamnese_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    anamnese_id UUID NOT NULL REFERENCES anamneses(id),
+    cliente_id UUID NOT NULL REFERENCES clientes(id),
+    reserva_id UUID REFERENCES reservas(id),
+    usado BOOLEAN DEFAULT false,
+    usado_em TIMESTAMPTZ,
+    expira_em TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    FOREIGN KEY (anamnese_id, empresa_id) REFERENCES anamneses(id, empresa_id),
+    FOREIGN KEY (cliente_id, empresa_id) REFERENCES clientes(id, empresa_id),
+    FOREIGN KEY (reserva_id, empresa_id) REFERENCES reservas(id, empresa_id)
+);
+
+CREATE UNIQUE INDEX uq_token_ativo_anamnese ON anamnese_tokens (anamnese_id) WHERE usado = false;
+
+-- Infra: webhooks, jobs, notificações
+CREATE TABLE webhook_inbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    origem TEXT NOT NULL CHECK (origem IN ('meta_whatsapp', 'mercado_pago')),
+    external_event_id TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    assinatura_verificada BOOLEAN DEFAULT false,
+    x_request_id TEXT,
+    headers JSONB,
+    processado BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(origem, external_event_id)
+);
+
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    tipo TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('pendente', 'processando', 'concluido', 'falhou')) DEFAULT 'pendente',
+    tentativas INT NOT NULL DEFAULT 0,
+    max_tentativas INT NOT NULL DEFAULT 3,
+    proxima_tentativa TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE job_tentativas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID NOT NULL REFERENCES jobs(id),
+    resultado TEXT,
+    erro_mensagem TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE dead_letter_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID NOT NULL UNIQUE REFERENCES jobs(id),
+    motivo TEXT NOT NULL,
+    alerta_enviado BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE notificacoes_internas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    empresa_id UUID NOT NULL REFERENCES empresas(id),
+    usuario_id UUID REFERENCES usuarios_internos(id),
+    tipo TEXT NOT NULL,
+    mensagem TEXT NOT NULL,
+    lida BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    FOREIGN KEY (usuario_id, empresa_id) REFERENCES usuarios_internos(id, empresa_id)
+);
+
+-- v3.4 (Ricardo: fila sem saída / Carlos #2): ponto único de notificação ao staff
+CREATE OR REPLACE FUNCTION notificar_staff(
+    p_empresa_id UUID,
+    p_tipo TEXT,
+    p_mensagem TEXT,
+    p_perfis TEXT[] DEFAULT ARRAY['admin','gestor']
+)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_count INT;
+BEGIN
+    INSERT INTO public.notificacoes_internas (empresa_id, usuario_id, tipo, mensagem)
+    SELECT p_empresa_id, u.id, p_tipo, p_mensagem
+    FROM public.usuarios_internos u
+    WHERE u.empresa_id = p_empresa_id AND u.ativo = true AND u.perfil = ANY(p_perfis);
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+
+
+-- ================================================================
+-- FICHEIRO: 007_rls.sql
+-- ================================================================
+
+-- 007_rls.sql — helpers, RLS em TODAS as tabelas, policies, privilégios de coluna
+
+-- Helpers (SECURITY DEFINER: leem usuarios_internos sem recursão de RLS)
+-- v3.3 (Ricardo: segurança): search_path='' + nomes totalmente qualificados
+CREATE OR REPLACE FUNCTION minha_empresa_id()
+RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+    SELECT empresa_id FROM public.usuarios_internos
+    WHERE auth_user_id = auth.uid() AND ativo = true LIMIT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION meu_perfil()
+RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+    SELECT perfil FROM public.usuarios_internos
+    WHERE auth_user_id = auth.uid() AND ativo = true LIMIT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION meu_usuario_id()
+RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+    SELECT id FROM public.usuarios_internos
+    WHERE auth_user_id = auth.uid() AND ativo = true LIMIT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION meu_profissional_id()
+RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+    SELECT up.profissional_id
+    FROM public.usuarios_internos u
+    JOIN public.usuario_profissional up ON up.usuario_id = u.id
+    WHERE u.auth_user_id = auth.uid() AND u.ativo = true LIMIT 1;
+$$;
+
+-- RLS em TODAS as tabelas
+ALTER TABLE empresas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tipos_recurso ENABLE ROW LEVEL SECURITY;
+ALTER TABLE recursos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profissionais ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usuarios_internos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usuario_profissional ENABLE ROW LEVEL SECURITY;
+ALTER TABLE log_acoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE log_acoes_sensiveis ENABLE ROW LEVEL SECURITY;
+ALTER TABLE templates_mensagem ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mensagens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transbordos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clientes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE modelos_anamnese ENABLE ROW LEVEL SECURITY;
+ALTER TABLE modelo_perguntas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE servicos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE servico_cardapios ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profissional_servicos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE modelos_pacote ENABLE ROW LEVEL SECURITY;
+ALTER TABLE modelo_pacote_itens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE horarios_empresa ENABLE ROW LEVEL SECURITY;
+ALTER TABLE horarios_profissional ENABLE ROW LEVEL SECURITY;
+ALTER TABLE excecoes_calendario ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agenda_ocupacoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bloqueios ENABLE ROW LEVEL SECURITY;
+ALTER TABLE anamneses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE anamnese_respostas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reservas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reserva_itens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cobrancas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transacoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE eventos_pagamento ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alocacoes_pagamento ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contas_creditos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE lancamentos_creditos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE credito_servicos_permitidos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compras_pacote ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compra_pacote_itens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pacote_utilizacoes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cartoes_presente ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cartao_presente_lancamentos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE revisoes_cancelamento ENABLE ROW LEVEL SECURITY;
+ALTER TABLE anamnese_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_inbox ENABLE ROW LEVEL SECURITY;
+ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE job_tentativas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dead_letter_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notificacoes_internas ENABLE ROW LEVEL SECURITY;
+
+-- Policies
+-- NOTA: o agendamento público corre em Edge Functions com service_role (contorna RLS).
+-- Não há policies anon: nenhum dado exposto ao público direto pela API.
+
+CREATE POLICY "usuarios_proprio" ON usuarios_internos FOR SELECT TO authenticated
+USING (auth_user_id = auth.uid());
+CREATE POLICY "usuarios_admin" ON usuarios_internos FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'admin');
+CREATE POLICY "up_proprio" ON usuario_profissional FOR SELECT TO authenticated
+USING (usuario_id = meu_usuario_id());
+CREATE POLICY "up_admin" ON usuario_profissional FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM usuarios_internos u WHERE u.id = usuario_id
+       AND u.empresa_id = minha_empresa_id()) AND meu_perfil() = 'admin');
+
+CREATE POLICY "empresas_staff" ON empresas FOR SELECT TO authenticated
+USING (id = minha_empresa_id());
+
+CREATE POLICY "tipos_recurso_ler" ON tipos_recurso FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "tipos_recurso_admin" ON tipos_recurso FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "recursos_ler" ON recursos FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "recursos_admin" ON recursos FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "profissionais_ler" ON profissionais FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "profissionais_admin" ON profissionais FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "servicos_ler" ON servicos FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "servicos_admin" ON servicos FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "cardapios_ler" ON servico_cardapios FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM servicos s WHERE s.id = servico_id AND s.empresa_id = minha_empresa_id()));
+CREATE POLICY "cardapios_admin" ON servico_cardapios FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM servicos s WHERE s.id = servico_id AND s.empresa_id = minha_empresa_id())
+       AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "prof_servicos_ler" ON profissional_servicos FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "prof_servicos_admin" ON profissional_servicos FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "modelos_ler" ON modelos_anamnese FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "modelos_admin" ON modelos_anamnese FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "perguntas_ler" ON modelo_perguntas FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM modelos_anamnese m WHERE m.id = modelo_id AND m.empresa_id = minha_empresa_id()));
+CREATE POLICY "perguntas_admin" ON modelo_perguntas FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM modelos_anamnese m WHERE m.id = modelo_id AND m.empresa_id = minha_empresa_id())
+       AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "hor_empresa_ler" ON horarios_empresa FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "hor_empresa_admin" ON horarios_empresa FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "hor_prof_ler" ON horarios_profissional FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM profissionais p WHERE p.id = profissional_id AND p.empresa_id = minha_empresa_id()));
+CREATE POLICY "hor_prof_admin" ON horarios_profissional FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM profissionais p WHERE p.id = profissional_id AND p.empresa_id = minha_empresa_id())
+       AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "excecoes_ler" ON excecoes_calendario FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "excecoes_admin" ON excecoes_calendario FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+-- Clientes
+CREATE POLICY "clientes_staff" ON clientes FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "clientes_profissional" ON clientes FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND EXISTS (
+    SELECT 1 FROM reserva_itens ri
+    JOIN reservas r ON r.id = ri.reserva_id
+    WHERE ri.profissional_id = meu_profissional_id()
+      AND r.cliente_id = clientes.id
+));
+
+-- Anamneses: admin + profissional revisora (v3.3: UPDATE da profissional sai daqui → RPC revisar_anamnese)
+CREATE POLICY "anamneses_admin" ON anamneses FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'admin');
+CREATE POLICY "anamneses_profissional" ON anamneses FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND profissional_revisora_id = meu_profissional_id());
+
+CREATE POLICY "resp_admin" ON anamnese_respostas FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM anamneses a WHERE a.id = anamnese_id
+       AND a.empresa_id = minha_empresa_id()) AND meu_perfil() = 'admin');
+CREATE POLICY "resp_profissional" ON anamnese_respostas FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM anamneses a WHERE a.id = anamnese_id
+       AND a.empresa_id = minha_empresa_id()
+       AND a.profissional_revisora_id = meu_profissional_id()));
+
+-- anamnese_tokens: SEM policies — tokens são segredos; só service_role (Edge Functions)
+
+-- Reservas e itens
+CREATE POLICY "reservas_staff" ON reservas FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "reservas_profissional" ON reservas FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND EXISTS (
+    SELECT 1 FROM reserva_itens ri
+    WHERE ri.reserva_id = reservas.id AND ri.profissional_id = meu_profissional_id()
+));
+
+CREATE POLICY "itens_staff" ON reserva_itens FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "itens_profissional" ON reserva_itens FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND profissional_id = meu_profissional_id());
+
+-- v3.3 (Ricardo: RLS não obriga RPC): ocupações passam a ser SÓ LEITURA para staff.
+-- Toda a escrita acontece via triggers (bloqueios) e RPCs, ambos SECURITY DEFINER.
+CREATE POLICY "ocupacoes_ler" ON agenda_ocupacoes FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+
+CREATE POLICY "bloqueios_staff" ON bloqueios FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "bloqueios_profissional" ON bloqueios FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND profissional_id = meu_profissional_id());
+
+-- Financeiro (v3.3: receção SÓ LÊ — pagamentos em dinheiro via RPC registrar_pagamento_presencial)
+CREATE POLICY "cobrancas_admin" ON cobrancas FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "cobrancas_ler" ON cobrancas FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'recepcao');
+
+CREATE POLICY "transacoes_admin" ON transacoes FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "transacoes_ler" ON transacoes FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'recepcao');
+
+CREATE POLICY "eventos_admin" ON eventos_pagamento FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM transacoes t WHERE t.id = transacao_id
+       AND t.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "alocacoes_admin" ON alocacoes_pagamento FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM transacoes t WHERE t.id = transacao_id
+       AND t.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor'));
+
+-- Créditos
+CREATE POLICY "contas_cred_admin" ON contas_creditos FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "contas_cred_ler" ON contas_creditos FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'recepcao');
+CREATE POLICY "lanc_cred_admin" ON lancamentos_creditos FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM contas_creditos c WHERE c.id = conta_id
+       AND c.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "lanc_cred_ler" ON lancamentos_creditos FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM contas_creditos c WHERE c.id = conta_id
+       AND c.empresa_id = minha_empresa_id()) AND meu_perfil() = 'recepcao');
+CREATE POLICY "cred_serv_admin" ON credito_servicos_permitidos FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM lancamentos_creditos l
+       JOIN contas_creditos c ON c.id = l.conta_id
+       WHERE l.id = lancamento_id AND c.empresa_id = minha_empresa_id())
+       AND meu_perfil() IN ('admin','gestor'));
+
+-- Pacotes
+CREATE POLICY "modelos_pacote_ler" ON modelos_pacote FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "modelos_pacote_admin" ON modelos_pacote FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "modelo_pacote_itens_ler" ON modelo_pacote_itens FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "modelo_pacote_itens_admin" ON modelo_pacote_itens FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "compras_pacote_admin" ON compras_pacote FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "compras_pacote_ler" ON compras_pacote FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'recepcao');
+CREATE POLICY "compra_itens_admin" ON compra_pacote_itens FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM compras_pacote cp WHERE cp.id = compra_id
+       AND cp.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "compra_itens_ler" ON compra_pacote_itens FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM compras_pacote cp WHERE cp.id = compra_id
+       AND cp.empresa_id = minha_empresa_id()) AND meu_perfil() = 'recepcao');
+CREATE POLICY "pacote_util_admin" ON pacote_utilizacoes FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM compras_pacote cp WHERE cp.id = compra_id
+       AND cp.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor'));
+
+-- Cartões
+CREATE POLICY "cartoes_admin" ON cartoes_presente FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+CREATE POLICY "cartoes_ler" ON cartoes_presente FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'recepcao');
+CREATE POLICY "cartao_lanc_admin" ON cartao_presente_lancamentos FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM cartoes_presente cp WHERE cp.id = cartao_id
+       AND cp.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor'));
+
+-- Conversas, mensagens, transbordos, templates, notificações, revisões, logs
+CREATE POLICY "conversas_staff" ON conversas FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "conversas_profissional" ON conversas FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND transbordada_para = meu_usuario_id());
+CREATE POLICY "mensagens_staff" ON mensagens FOR ALL TO authenticated
+USING (EXISTS (SELECT 1 FROM conversas c WHERE c.id = conversa_id
+       AND c.empresa_id = minha_empresa_id()) AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "mensagens_profissional" ON mensagens FOR SELECT TO authenticated
+USING (EXISTS (SELECT 1 FROM conversas c WHERE c.id = conversa_id
+       AND c.empresa_id = minha_empresa_id() AND c.transbordada_para = meu_usuario_id()));
+
+CREATE POLICY "transbordos_staff" ON transbordos FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor','recepcao'));
+CREATE POLICY "transbordos_prof_ler" ON transbordos FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND profissional_id = meu_profissional_id());
+CREATE POLICY "transbordos_prof_update" ON transbordos FOR UPDATE TO authenticated
+USING (empresa_id = minha_empresa_id() AND profissional_id = meu_profissional_id());
+
+CREATE POLICY "templates_ler" ON templates_mensagem FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id());
+CREATE POLICY "templates_admin" ON templates_mensagem FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "notif_proprio" ON notificacoes_internas FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND usuario_id = meu_usuario_id());
+CREATE POLICY "notif_update" ON notificacoes_internas FOR UPDATE TO authenticated
+USING (empresa_id = minha_empresa_id() AND usuario_id = meu_usuario_id());
+
+CREATE POLICY "revisoes_admin" ON revisoes_cancelamento FOR ALL TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() IN ('admin','gestor'));
+
+CREATE POLICY "log_admin" ON log_acoes FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'admin');
+CREATE POLICY "log_sensivel_admin" ON log_acoes_sensiveis FOR SELECT TO authenticated
+USING (empresa_id = minha_empresa_id() AND meu_perfil() = 'admin');
+
+-- webhook_inbox, jobs, job_tentativas, dead_letter_jobs: SEM policies — só service_role.
+
+-- =====================================================================
+-- v3.4 (Carlos #6): escrita nas tabelas nucleares SÓ via RPCs (SECURITY DEFINER).
+-- Staff autenticado lê (policies acima); INSERT/UPDATE/DELETE revogados.
+-- =====================================================================
+REVOKE INSERT, UPDATE, DELETE ON reservas FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON reserva_itens FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON cobrancas FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON transacoes FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON agenda_ocupacoes FROM anon, authenticated;
+
+-- v3.4.1 (auditoria #6): fecha TODOS os atalhos que contornavam RPC e MFA.
+-- Sem estes REVOKEs, as policies FOR ALL abaixo deixavam o staff:
+--   - inserir bloqueio direto na tabela (morria no EXCLUDE 23P01 em vez de usar a RPC);
+--   - DECIDIR revisão na mão (UPDATE decisao_final) — sem resolver_revisao, sem aal2, sem log;
+--   - criar lançamento de crédito na mão (dinheiro inventado).
+REVOKE INSERT, UPDATE, DELETE ON bloqueios FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON revisoes_cancelamento FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON contas_creditos FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON lancamentos_creditos FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON eventos_pagamento FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON anamnese_tokens FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON webhook_inbox FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON jobs FROM anon, authenticated;
+REVOKE INSERT, UPDATE, DELETE ON dead_letter_jobs FROM anon, authenticated;
+-- notificacoes_internas: UPDATE continua permitido (marcar como lida); criação é só do sistema
+REVOKE INSERT, DELETE ON notificacoes_internas FROM anon, authenticated;
+
+
+-- ================================================================
+-- FICHEIRO: 008_booking_rpc.sql
+-- ================================================================
+
+-- 008_booking_rpc.sql (v3.4) — criação de pré-reserva e cancelamento individual de item
+-- SECURITY DEFINER (contorna RLS) → guarda de inquilino + verificação de perfil; search_path=''
+
+-- v3.4: timezone explícito (Ricardo), calendário de exceções completo (Carlos #8),
+-- retry de mesa em corrida (Carlos #12), erro amigável de concorrência (Ricardo),
+-- percentual de sinal por serviço (Ricardo), ficha ligada ao item (Carlos #11).
+CREATE OR REPLACE FUNCTION criar_pre_reserva(
+    p_empresa_id UUID,
+    p_cliente_id UUID,
+    p_itens JSONB,              -- [{servico_id, profissional_id, inicio, cardapio?}]
+    p_idempotencia_key TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_reserva_id UUID;
+    v_item JSONB;
+    v_servico RECORD;
+    v_profissional RECORD;
+    v_recurso RECORD;
+    v_cand RECORD;
+    v_exc RECORD;
+    v_item_id UUID;
+    v_inicio TIMESTAMPTZ;
+    v_fim TIMESTAMPTZ;
+    v_local_i TIMESTAMP;        -- horário LOCAL do studio (independe da sessão)
+    v_local_f TIMESTAMP;
+    v_preco DECIMAL(10,2);
+    v_cardapio TEXT;
+    v_dow INT;
+    v_anamnese_id UUID;
+    v_token TEXT;
+    v_anamneses JSONB := '[]'::JSONB;
+    v_total DECIMAL(10,2);
+    v_sinal DECIMAL(10,2);
+    v_pct_reserva INT := NULL;
+    v_ok BOOLEAN;
+BEGIN
+    -- Guarda: autenticado tem de ter vínculo ativo com a empresa
+    IF auth.role() = 'authenticated' THEN
+        IF public.minha_empresa_id() IS NULL THEN
+            RAISE EXCEPTION 'Utilizador sem vínculo ativo';
+        END IF;
+        IF p_empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+            RAISE EXCEPTION 'Sem permissão para esta empresa';
+        END IF;
+    END IF;
+
+    -- Idempotência POR EMPRESA
+    SELECT id INTO v_reserva_id FROM public.reservas
+    WHERE empresa_id = p_empresa_id AND idempotencia_key = p_idempotencia_key;
+    IF FOUND THEN
+        RETURN jsonb_build_object(
+            'reserva_id', v_reserva_id, 'idempotente', true,
+            'valor_total', (SELECT valor_total FROM public.reservas WHERE id = v_reserva_id),
+            'valor_sinal', (SELECT valor_sinal_total FROM public.reservas WHERE id = v_reserva_id),
+            'anamneses', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object('anamnese_id', a.id))
+                FROM public.anamneses a
+                WHERE a.empresa_id = p_empresa_id
+                  AND a.id IN (SELECT t.anamnese_id FROM public.anamnese_tokens t WHERE t.reserva_id = v_reserva_id)
+            ), '[]'::JSONB)
+        );
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM public.clientes WHERE id = p_cliente_id AND empresa_id = p_empresa_id) THEN
+        RAISE EXCEPTION 'Cliente não encontrado nesta empresa';
+    END IF;
+
+    IF p_itens IS NULL OR jsonb_array_length(p_itens) = 0 THEN
+        RAISE EXCEPTION 'A reserva precisa de pelo menos um serviço';
+    END IF;
+
+    INSERT INTO public.reservas (empresa_id, cliente_id, estado, percentual_sinal, idempotencia_key)
+    VALUES (p_empresa_id, p_cliente_id, 'pre_reserva', 30, p_idempotencia_key)
+    RETURNING id INTO v_reserva_id;
+
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_itens)
+    LOOP
+        v_item_id := NULL;
+        v_inicio := (v_item->>'inicio')::TIMESTAMPTZ;
+        v_cardapio := COALESCE(v_item->>'cardapio', 'feminino');
+
+        SELECT * INTO v_servico FROM public.servicos
+        WHERE id = (v_item->>'servico_id')::UUID
+          AND empresa_id = p_empresa_id AND ativo = true;
+        IF NOT FOUND THEN RAISE EXCEPTION 'Serviço não encontrado ou inativo'; END IF;
+
+        IF v_servico.anamnese_obrigatoria AND v_servico.modelo_anamnese_id IS NULL THEN
+            RAISE EXCEPTION 'Serviço % exige anamnese, mas não tem modelo configurado', v_servico.nome_tecnico;
+        END IF;
+
+        IF v_inicio <= now() THEN
+            RAISE EXCEPTION 'Não é possível agendar no passado';
+        END IF;
+
+        v_fim := v_inicio + (v_servico.duracao_minutos || ' minutes')::INTERVAL;
+        v_pct_reserva := COALESCE(v_pct_reserva, v_servico.percentual_sinal);
+
+        -- Hora LOCAL do studio: não depende do timezone da sessão (Ricardo)
+        v_local_i := v_inicio AT TIME ZONE 'America/Sao_Paulo';
+        v_local_f := v_fim AT TIME ZONE 'America/Sao_Paulo';
+        v_dow := EXTRACT(DOW FROM v_local_i)::INT; -- 0=domingo
+
+        -- Profissional habilitada, ativa e da empresa
+        SELECT p.* INTO v_profissional
+        FROM public.profissionais p
+        JOIN public.profissional_servicos ps ON ps.profissional_id = p.id
+        WHERE p.id = (v_item->>'profissional_id')::UUID
+          AND p.empresa_id = p_empresa_id
+          AND p.ativo = true
+          AND ps.servico_id = v_servico.id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Profissional não habilitada para este serviço';
+        END IF;
+
+        -- ===== Calendário de exceções na ordem correta (Carlos #8) =====
+        -- 1. Fechamento GERAL (folga/feriado da empresa) bloqueia TUDO
+        IF EXISTS (
+            SELECT 1 FROM public.excecoes_calendario e
+            WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+              AND e.profissional_id IS NULL AND e.tipo IN ('folga', 'feriado')
+        ) THEN
+            RAISE EXCEPTION 'Sem atendimento nesta data (folga ou feriado)';
+        END IF;
+
+        -- 2. Folga da PROFISSIONAL bloqueia só ela
+        IF EXISTS (
+            SELECT 1 FROM public.excecoes_calendario e
+            WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+              AND e.profissional_id = v_profissional.id AND e.tipo IN ('folga', 'feriado')
+        ) THEN
+            RAISE EXCEPTION 'Profissional de folga nesta data';
+        END IF;
+
+        -- 3. Ajuste da profissional SUBSTITUI o horário normal dela
+        SELECT e.abertura, e.fechamento INTO v_exc
+        FROM public.excecoes_calendario e
+        WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+          AND e.profissional_id = v_profissional.id AND e.tipo = 'ajuste'
+        LIMIT 1;
+
+        IF FOUND THEN
+            IF v_exc.abertura IS NULL OR v_exc.fechamento IS NULL THEN
+                RAISE EXCEPTION 'Ajuste de horário sem período definido';
+            END IF;
+            IF v_local_i::TIME < v_exc.abertura OR v_local_f::TIME > v_exc.fechamento THEN
+                RAISE EXCEPTION 'Fora do horário especial da profissional nesta data';
+            END IF;
+        ELSE
+            -- 4. Ajuste da empresa substitui o horário normal da empresa
+            SELECT e.abertura, e.fechamento INTO v_exc
+            FROM public.excecoes_calendario e
+            WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+              AND e.profissional_id IS NULL AND e.tipo = 'ajuste'
+            LIMIT 1;
+            IF FOUND THEN
+                IF v_exc.abertura IS NULL OR v_exc.fechamento IS NULL THEN
+                    RAISE EXCEPTION 'Ajuste de horário da empresa sem período definido';
+                END IF;
+                IF v_local_i::TIME < v_exc.abertura OR v_local_f::TIME > v_exc.fechamento THEN
+                    RAISE EXCEPTION 'Fora do horário especial desta data';
+                END IF;
+            ELSE
+                -- 5. Horário recorrente da empresa
+                IF NOT EXISTS (
+                    SELECT 1 FROM public.horarios_empresa h
+                    WHERE h.empresa_id = p_empresa_id AND h.dia_semana = v_dow AND h.ativo = true
+                      AND v_local_i::TIME >= h.abertura AND v_local_f::TIME <= h.fechamento
+                ) THEN
+                    RAISE EXCEPTION 'Fora do horário de funcionamento';
+                END IF;
+            END IF;
+
+            -- Horário recorrente da profissional (só quando não há ajuste dela)
+            IF NOT EXISTS (
+                SELECT 1 FROM public.horarios_profissional h
+                WHERE h.profissional_id = v_profissional.id AND h.dia_semana = v_dow AND h.ativo = true
+                  AND v_local_i::TIME >= h.abertura AND v_local_f::TIME <= h.fechamento
+            ) THEN
+                RAISE EXCEPTION 'Profissional não atende neste dia/horário';
+            END IF;
+        END IF;
+        -- ===== fim do calendário =====
+
+        -- Profissional livre (erro claro; EXCLUDE + retry são a rede de segurança)
+        IF EXISTS (
+            SELECT 1 FROM public.agenda_ocupacoes o
+            WHERE o.profissional_id = v_profissional.id
+              AND o.estado = 'ativa'
+              AND o.periodo && tstzrange(v_inicio, v_fim, '[)')
+        ) THEN
+            RAISE EXCEPTION 'Profissional indisponível neste horário';
+        END IF;
+
+        SELECT COALESCE(sc.preco_final, v_servico.preco_base) INTO v_preco
+        FROM public.servico_cardapios sc
+        WHERE sc.servico_id = v_servico.id AND sc.cardapio = v_cardapio AND sc.ativo = true;
+        v_preco := COALESCE(v_preco, v_servico.preco_base);
+
+        -- Mesa com RETRY: se outra transação ganhar a mesa, tenta a seguinte (Carlos #12)
+        v_ok := false;
+        FOR v_cand IN
+            SELECT r.* FROM public.recursos r
+            WHERE r.tipo_recurso_id = v_servico.tipo_recurso_id
+              AND r.empresa_id = p_empresa_id AND r.ativo = true
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.agenda_ocupacoes o
+                  WHERE o.recurso_id = r.id AND o.estado = 'ativa'
+                    AND o.periodo && tstzrange(v_inicio, v_fim, '[)')
+              )
+            ORDER BY r.nome
+        LOOP
+            IF v_item_id IS NULL THEN
+                INSERT INTO public.reserva_itens (
+                    reserva_id, empresa_id, nome_servico, preco_base_utilizado,
+                    preco_final, duracao_reservada, percentual_sinal, valor_sinal,
+                    servico_id, profissional_id, recurso_id, inicio, fim
+                ) VALUES (
+                    v_reserva_id, p_empresa_id, v_servico.nome_tecnico, v_servico.preco_base,
+                    v_preco, v_servico.duracao_minutos, v_servico.percentual_sinal,
+                    ROUND(v_preco * v_servico.percentual_sinal / 100.0, 2),
+                    v_servico.id, v_profissional.id, v_cand.id, v_inicio, v_fim
+                ) RETURNING id INTO v_item_id;
+            ELSE
+                UPDATE public.reserva_itens SET recurso_id = v_cand.id WHERE id = v_item_id;
+            END IF;
+
+            BEGIN
+                INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, recurso_id, reserva_item_id, inicio, fim, origem, origem_id, estado, expires_at)
+                VALUES (p_empresa_id, 'recurso', v_cand.id, v_item_id, v_inicio, v_fim, 'pre_reserva', v_reserva_id, 'ativa', now() + interval '30 minutes');
+                v_ok := true;
+                EXIT;
+            EXCEPTION WHEN exclusion_violation THEN
+                NULL; -- outra transação ficou com esta mesa; tentar a próxima
+            END;
+        END LOOP;
+
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'Nenhum recurso compatível disponível neste horário';
+        END IF;
+
+        -- Ocupação da profissional (concorrência vira mensagem clara — Ricardo)
+        BEGIN
+            INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, profissional_id, reserva_item_id, inicio, fim, origem, origem_id, estado, expires_at)
+            VALUES (p_empresa_id, 'profissional', v_profissional.id, v_item_id, v_inicio, v_fim, 'pre_reserva', v_reserva_id, 'ativa', now() + interval '30 minutes');
+        EXCEPTION WHEN exclusion_violation THEN
+            RAISE EXCEPTION 'Profissional indisponível neste horário';
+        END;
+
+        -- Anamnese: ficha ligada AO ITEM + token bruto devolvido uma única vez
+        IF v_servico.anamnese_obrigatoria THEN
+            INSERT INTO public.anamneses (empresa_id, cliente_id, servico_id, modelo_id, versao_modelo, estado, reserva_item_id, profissional_revisora_id)
+            SELECT p_empresa_id, p_cliente_id, v_servico.id, m.id, m.versao, 'pendente', v_item_id, v_profissional.id
+            FROM public.modelos_anamnese m WHERE m.id = v_servico.modelo_anamnese_id
+            RETURNING id INTO v_anamnese_id;
+
+            v_token := public.gerar_token_opaco();
+
+            INSERT INTO public.anamnese_tokens (empresa_id, token_hash, anamnese_id, cliente_id, reserva_id, expira_em)
+            VALUES (
+                p_empresa_id, public.sha256_hex(v_token),
+                v_anamnese_id, p_cliente_id, v_reserva_id,
+                LEAST(v_inicio, now() + interval '24 hours')
+            );
+
+            v_anamneses := v_anamneses || jsonb_build_object(
+                'anamnese_id', v_anamnese_id,
+                'token', v_token,
+                'expira_em', LEAST(v_inicio, now() + interval '24 hours')
+            );
+        END IF;
+    END LOOP;
+
+    UPDATE public.reservas r SET
+        valor_total = t.total,
+        valor_sinal_total = t.sinal,
+        percentual_sinal = v_pct_reserva
+    FROM (SELECT SUM(preco_final) AS total, SUM(valor_sinal) AS sinal
+          FROM public.reserva_itens WHERE reserva_id = v_reserva_id) t
+    WHERE r.id = v_reserva_id
+    RETURNING r.valor_total, r.valor_sinal_total INTO v_total, v_sinal;
+
+    INSERT INTO public.cobrancas (reserva_id, empresa_id, valor_total, percentual_sinal, valor_sinal)
+    VALUES (v_reserva_id, p_empresa_id, v_total, v_pct_reserva, v_sinal);
+
+    -- v3.4.1 (auditoria #3): sinal ZERO (percentual_sinal = 0 — a configuração da fase
+    -- de agenda vazia) não pode morrer nos 30 min: nasce CONFIRMADA, ocupações sem
+    -- expires_at, sem PIX a esperar. O saldo paga-se no estúdio.
+    IF v_sinal <= 0 THEN
+        UPDATE public.reservas SET estado = 'confirmada' WHERE id = v_reserva_id;
+        UPDATE public.reserva_itens SET estado = 'confirmado'
+        WHERE reserva_id = v_reserva_id AND estado = 'pendente';
+        UPDATE public.agenda_ocupacoes SET origem = 'reserva', expires_at = NULL
+        WHERE origem = 'pre_reserva' AND origem_id = v_reserva_id AND estado = 'ativa';
+    END IF;
+
+    RETURN jsonb_build_object(
+        'reserva_id', v_reserva_id,
+        'idempotente', false,
+        'estado', CASE WHEN v_sinal <= 0 THEN 'confirmada' ELSE 'pre_reserva' END,
+        'valor_total', v_total,
+        'valor_sinal', v_sinal,
+        'anamneses', v_anamneses
+    );
+
+EXCEPTION
+    WHEN unique_violation THEN
+        SELECT id INTO v_reserva_id FROM public.reservas
+        WHERE empresa_id = p_empresa_id AND idempotencia_key = p_idempotencia_key;
+        IF FOUND THEN
+            RETURN jsonb_build_object('reserva_id', v_reserva_id, 'idempotente', true, 'anamneses', '[]'::JSONB);
+        END IF;
+        RAISE;
+    WHEN exclusion_violation THEN
+        RAISE EXCEPTION 'Esse horário acabou de ser preenchido por outro cliente. Tenta outro horário.';
+END;
+$$;
+
+-- v3.4 (Ricardo: último item zerava a revisão / Carlos #3: regra 16h e valor proporcional por item)
+CREATE OR REPLACE FUNCTION cancelar_item_reserva(
+    p_reserva_item_id UUID,
+    p_excecao TEXT DEFAULT NULL,
+    p_motivo TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_item RECORD;
+    v_restantes INT;
+    v_limite TIMESTAMP;
+    v_regra TEXT;
+    v_pago_reserva DECIMAL(10,2);
+    v_valor_item DECIMAL(10,2);
+BEGIN
+    SELECT ri.*, r.empresa_id AS r_empresa_id INTO v_item
+    FROM public.reserva_itens ri
+    JOIN public.reservas r ON r.id = ri.reserva_id
+    WHERE ri.id = p_reserva_item_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Item não encontrado'; END IF;
+
+    IF auth.role() = 'authenticated' THEN
+        IF v_item.r_empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+            RAISE EXCEPTION 'Sem permissão para esta empresa';
+        END IF;
+        IF public.meu_perfil() NOT IN ('admin','gestor','recepcao')
+           AND NOT (public.meu_perfil() = 'profissional' AND v_item.profissional_id = public.meu_profissional_id()) THEN
+            RAISE EXCEPTION 'Sem permissão para cancelar este item';
+        END IF;
+    END IF;
+
+    IF p_excecao IS NOT NULL THEN
+        IF p_excecao NOT IN ('credito', 'estorno', 'perdido') THEN
+            RAISE EXCEPTION 'Exceção inválida: %', p_excecao;
+        END IF;
+        IF auth.role() = 'authenticated' AND public.meu_perfil() <> 'admin' THEN
+            RAISE EXCEPTION 'Exceção de cancelamento exige perfil admin';
+        END IF;
+        IF p_motivo IS NULL OR length(trim(p_motivo)) = 0 THEN
+            RAISE EXCEPTION 'Exceção de cancelamento exige motivo';
+        END IF;
+    END IF;
+
+    -- Ordem de lock global (anti-deadlock): RESERVA primeiro, depois o item
+    PERFORM 1 FROM public.reservas WHERE id = v_item.reserva_id FOR UPDATE;
+
+    -- Re-lê o item já sob lock (leitura anterior era sem lock)
+    SELECT ri.*, r.empresa_id AS r_empresa_id, r.estado AS r_estado INTO v_item
+    FROM public.reserva_itens ri
+    JOIN public.reservas r ON r.id = ri.reserva_id
+    WHERE ri.id = p_reserva_item_id FOR UPDATE OF ri;
+
+    -- v3.4.1: dinheiro em revisão só sai pela fila — cancelar item aqui
+    -- contabilizaria o mesmo dinheiro duas vezes
+    IF v_item.r_estado = 'pagamento_em_revisao' THEN
+        RAISE EXCEPTION 'Reserva em revisão de pagamento — decida pela RPC resolver_revisao';
+    END IF;
+
+    IF v_item.estado NOT IN ('pendente', 'confirmado') THEN
+        RAISE EXCEPTION 'Item não pode ser cancelado no estado atual';
+    END IF;
+
+    SELECT COUNT(*) INTO v_restantes
+    FROM public.reserva_itens
+    WHERE reserva_id = v_item.reserva_id AND estado IN ('pendente', 'confirmado') AND id <> p_reserva_item_id;
+
+    -- Último item: cancela a RESERVA primeiro — a revisão fica com o valor CHEIO (Ricardo A3)
+    IF v_restantes = 0 THEN
+        PERFORM public.cancelar_reserva(v_item.reserva_id, p_excecao, p_motivo);
+        RETURN 'reserva_cancelada';
+    END IF;
+
+    -- Regra das 16h calculada para ESTE item (Carlos #3), em hora local do studio
+    v_limite := ((v_item.inicio AT TIME ZONE 'America/Sao_Paulo')::DATE - 1) + interval '16 hours';
+    v_regra := CASE WHEN (now() AT TIME ZONE 'America/Sao_Paulo') <= v_limite
+                    THEN 'credito_automatico' ELSE 'perda_automatica' END;
+
+    UPDATE public.reserva_itens SET estado = 'cancelado' WHERE id = p_reserva_item_id;
+
+    UPDATE public.agenda_ocupacoes SET estado = 'cancelada'
+    WHERE reserva_item_id = p_reserva_item_id AND estado = 'ativa';
+
+    -- Revisão só quando há DINHEIRO pago na reserva; valor proporcional a ESTE
+    -- item (Carlos #3). v3.4.1 (auditoria #1): desconta o que JÁ está na fila —
+    -- a fila nunca vale mais do que o dinheiro recebido
+    SELECT COALESCE(SUM(t.valor), 0) INTO v_pago_reserva
+    FROM public.cobrancas c
+    JOIN public.transacoes t ON t.cobranca_id = c.id
+    WHERE c.reserva_id = v_item.reserva_id AND t.estado = 'pago'
+      AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total');
+
+    -- v3.4.1b: 'confirmar' devolve o dinheiro à reserva viva — NÃO entra no
+    -- desconto (senão um cancelamento depois de um confirmar perdia o rasto do valor)
+    v_valor_item := LEAST(v_item.valor_sinal,
+        v_pago_reserva - COALESCE((SELECT SUM(rev.valor_sinal) FROM public.revisoes_cancelamento rev
+                                   WHERE rev.reserva_id = v_item.reserva_id
+                                     AND rev.decisao_final IS DISTINCT FROM 'confirmar'), 0));
+
+    IF v_valor_item > 0 THEN
+        INSERT INTO public.revisoes_cancelamento
+            (reserva_id, reserva_item_id, empresa_id, valor_sinal, regra_aplicada, decisao_final, decidido_por, motivo_decisao)
+        VALUES
+            (v_item.reserva_id, p_reserva_item_id, v_item.r_empresa_id, v_valor_item,
+             v_regra, p_excecao, public.meu_usuario_id(), p_motivo)
+        ON CONFLICT DO NOTHING;
+
+        PERFORM public.notificar_staff(v_item.r_empresa_id, 'cancelamento_item',
+            'Item cancelado com R$ ' || trim(to_char(v_valor_item, '999990D00')) ||
+            ' pago — ' || v_item.nome_servico || ' (' || v_regra || ')');
+    END IF;
+
+    UPDATE public.reservas r SET
+        valor_total = t.total,
+        valor_sinal_total = t.sinal
+    FROM (SELECT COALESCE(SUM(preco_final),0) AS total, COALESCE(SUM(valor_sinal),0) AS sinal
+          FROM public.reserva_itens
+          WHERE reserva_id = v_item.reserva_id AND estado <> 'cancelado') t
+    WHERE r.id = v_item.reserva_id;
+
+    UPDATE public.cobrancas c SET
+        valor_total = r.valor_total,
+        valor_sinal = r.valor_sinal_total
+    FROM public.reservas r
+    WHERE c.reserva_id = r.id AND r.id = v_item.reserva_id AND c.estado = 'pendente';
+
+    RETURN v_regra;
+END;
+$$;
+
+
+-- ================================================================
+-- FICHEIRO: 009_payment_rpc.sql
+-- ================================================================
+
+-- 009_payment_rpc.sql (v3.4) — confirmação, cancelamento (regra 16h), pagamento
+-- presencial, desistência de pré-reserva, revisão de anamnese, reemissão de token,
+-- expiração — + GRANT/REVOKE de EXECUTE.
+--
+-- v3.4:
+--  - pagamento ATRASADO não confirma: libera o slot (ocupações expiradas), move a
+--    reserva para 'pagamento_em_revisao' e notifica o staff (Ricardo/Carlos — fim
+--    do sequestro do slot e da fila sem saída);
+--  - estado novo 'expirada' separa expiração de cancelamento (006);
+--  - registrar_pagamento_presencial idempotente (chave do caixa), retorna JSONB,
+--    valor ≤ pendente, MFA (aal2) para staff — Ricardo A4/#7;
+--  - cancelar_reserva: regra das 16h em hora LOCAL do estúdio (Ricardo #4),
+--    exceção exige admin + aal2 + motivo, revisão só quando há dinheiro pago;
+--  - regenerar_token: expiração = MIN(agendamento, 24h) (Carlos #2) e exige
+--    perfil de equipe (Carlos #3);
+--  - expirar_pre_reservas: FOR UPDATE SKIP LOCKED — nunca espera atrás de
+--    confirmar/webhook (Ricardo A1).
+
+-- ---------------------------------------------------------------- confirmar_reserva
+CREATE OR REPLACE FUNCTION confirmar_reserva(p_reserva_id UUID)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_reserva RECORD;
+    v_pago DECIMAL(10,2);
+    v_atrasado BOOLEAN;
+BEGIN
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = p_reserva_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Reserva não encontrada'; END IF;
+
+    IF auth.role() = 'authenticated' AND v_reserva.empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+        RAISE EXCEPTION 'Sem permissão para esta empresa';
+    END IF;
+
+    IF v_reserva.estado = 'confirmada' THEN RETURN 'ja_confirmada'; END IF;
+    IF v_reserva.estado = 'pagamento_em_revisao' THEN RETURN 'pagamento_em_revisao'; END IF;
+    IF v_reserva.estado <> 'pre_reserva' THEN
+        RAISE EXCEPTION 'Reserva não está em pré-reserva (estado: %)', v_reserva.estado;
+    END IF;
+
+    -- Aceita sinal OU pagamento 100%, conferindo o VALOR
+    SELECT COALESCE(SUM(t.valor), 0) INTO v_pago
+    FROM public.cobrancas c
+    JOIN public.transacoes t ON t.cobranca_id = c.id
+    WHERE c.reserva_id = p_reserva_id
+      AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total')
+      AND t.estado = 'pago';
+
+    IF v_pago < COALESCE(v_reserva.valor_sinal_total, 0) THEN
+        RAISE EXCEPTION 'Sinal não pago (pago: %, exigido: %)', v_pago, v_reserva.valor_sinal_total;
+    END IF;
+
+    -- Atraso = ocupação já expirada OU expires_at passou (mesmo que o cron ainda não tenha corrido)
+    SELECT EXISTS (
+        SELECT 1 FROM public.agenda_ocupacoes
+        WHERE origem = 'pre_reserva' AND origem_id = p_reserva_id
+          AND (estado = 'expirada' OR (estado = 'ativa' AND expires_at <= now()))
+    ) INTO v_atrasado;
+
+    IF v_atrasado THEN
+        -- v3.4: o slot é LIBERADO na hora; o dinheiro vai para a fila de revisão
+        UPDATE public.agenda_ocupacoes SET estado = 'expirada'
+        WHERE origem = 'pre_reserva' AND origem_id = p_reserva_id AND estado = 'ativa';
+
+        UPDATE public.reservas SET estado = 'pagamento_em_revisao' WHERE id = p_reserva_id;
+
+        INSERT INTO public.revisoes_cancelamento (reserva_id, empresa_id, valor_sinal, regra_aplicada, motivo_decisao)
+        VALUES (p_reserva_id, v_reserva.empresa_id, v_pago, 'pagamento_atrasado',
+                'Sinal pago após o prazo da pré-reserva — confirmar (se o horário ainda estiver livre), estornar ou dar crédito')
+        ON CONFLICT DO NOTHING;   -- uma única revisão aberta por reserva (índice parcial 006)
+
+        PERFORM public.notificar_staff(v_reserva.empresa_id, 'pagamento_em_revisao',
+            'Pagamento atrasado na reserva ' || p_reserva_id::text || ' (R$ ' ||
+            trim(to_char(v_pago, '999990D00')) || '). O horário foi liberado. Decida: confirmar, estornar, crédito ou perdido.');
+
+        RETURN 'pagamento_em_revisao';
+    END IF;
+
+    UPDATE public.reservas SET estado = 'confirmada' WHERE id = p_reserva_id;
+
+    UPDATE public.reserva_itens SET estado = 'confirmado'
+    WHERE reserva_id = p_reserva_id AND estado = 'pendente';
+
+    UPDATE public.agenda_ocupacoes
+    SET origem = 'reserva', expires_at = NULL
+    WHERE origem = 'pre_reserva' AND origem_id = p_reserva_id AND estado = 'ativa';
+
+    UPDATE public.cobrancas
+    SET estado = CASE WHEN v_pago >= v_reserva.valor_total THEN 'total_pago' ELSE 'sinal_pago' END
+    WHERE reserva_id = p_reserva_id AND estado = 'pendente';
+
+    RETURN 'confirmada';
+END;
+$$;
+
+-- --------------------------------------------------- revisao_completar_fila
+-- v3.4.1b (achado da prova de corrida F9: webhook de saldo × cancelar_reserva).
+-- A fila aberta ao nível da reserva vale SEMPRE:
+--     dinheiro pago − já decidido (≠ 'confirmar') − já na fila por item.
+-- Pagamento novo em reserva morta/em revisão COMPLETA a fila até esse valor —
+-- antes, o INSERT bruto com ON CONFLICT DO NOTHING era engolido pelo índice
+-- uq_revisao_aberta_reserva (dinheiro sem rasto) ou contava a fila em dobro.
+-- Pré-condição: o chamador TEM de estar com a linha da reserva bloqueada (FOR UPDATE).
+CREATE OR REPLACE FUNCTION public.revisao_completar_fila(
+    p_reserva_id UUID,
+    p_regra TEXT,
+    p_motivo TEXT
+)
+RETURNS DECIMAL               -- quanto ficou na revisão aberta ao nível da reserva
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_empresa UUID;
+    v_pago DECIMAL(10,2);
+    v_coberto DECIMAL(10,2);
+    v_alvo DECIMAL(10,2);
+BEGIN
+    SELECT r.empresa_id INTO v_empresa FROM public.reservas r WHERE r.id = p_reserva_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Reserva não encontrada'; END IF;
+
+    SELECT COALESCE(SUM(t.valor), 0) INTO v_pago
+    FROM public.cobrancas c
+    JOIN public.transacoes t ON t.cobranca_id = c.id
+    WHERE c.reserva_id = p_reserva_id AND t.estado = 'pago'
+      AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total');
+
+    -- Coberto = dinheiro já encaminhado (decisões ≠ confirmar, em qualquer nível)
+    --         + dinheiro já à espera na fila POR ITEM. A revisão aberta ao nível
+    -- da reserva NÃO entra: é ela que estamos a completar.
+    SELECT COALESCE(SUM(rev.valor_sinal), 0) INTO v_coberto
+    FROM public.revisoes_cancelamento rev
+    WHERE rev.reserva_id = p_reserva_id
+      AND ((rev.decisao_final IS NOT NULL AND rev.decisao_final <> 'confirmar')
+           OR (rev.decisao_final IS NULL AND rev.reserva_item_id IS NOT NULL));
+
+    v_alvo := v_pago - v_coberto;
+    IF v_alvo <= 0 THEN RETURN 0; END IF;
+
+    UPDATE public.revisoes_cancelamento rev
+    SET valor_sinal = v_alvo, motivo_decisao = p_motivo
+    WHERE rev.reserva_id = p_reserva_id
+      AND rev.reserva_item_id IS NULL AND rev.decisao_final IS NULL;
+
+    IF NOT FOUND THEN
+        INSERT INTO public.revisoes_cancelamento (reserva_id, empresa_id, valor_sinal, regra_aplicada, motivo_decisao)
+        VALUES (p_reserva_id, v_empresa, v_alvo, p_regra, p_motivo)
+        ON CONFLICT DO NOTHING;
+    END IF;
+    RETURN v_alvo;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.revisao_completar_fila(UUID, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.revisao_completar_fila(UUID, TEXT, TEXT) TO service_role;
+
+-- ---------------------------------------------------------------- cancelar_reserva
+CREATE OR REPLACE FUNCTION cancelar_reserva(
+    p_reserva_id UUID,
+    p_excecao TEXT DEFAULT NULL,   -- 'credito' | 'estorno' | 'perdido'
+    p_motivo TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_reserva RECORD;
+    v_limite TIMESTAMP;
+    v_regra TEXT;
+    v_usuario UUID;
+    v_pago DECIMAL(10,2);
+BEGIN
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = p_reserva_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Reserva não encontrada'; END IF;
+
+    IF auth.role() = 'authenticated' AND v_reserva.empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+        RAISE EXCEPTION 'Sem permissão para esta empresa';
+    END IF;
+
+    IF v_reserva.estado = 'pagamento_em_revisao' THEN
+        RAISE EXCEPTION 'Reserva em revisão de pagamento — decida pela RPC resolver_revisao';
+    END IF;
+
+    IF p_excecao IS NOT NULL THEN
+        IF p_excecao NOT IN ('credito', 'estorno', 'perdido') THEN
+            RAISE EXCEPTION 'Exceção inválida: %', p_excecao;
+        END IF;
+        IF auth.role() = 'authenticated' THEN
+            IF public.meu_perfil() <> 'admin' THEN
+                RAISE EXCEPTION 'Exceção de cancelamento exige perfil admin';
+            END IF;
+            -- v3.4 (Ricardo A2): exceção mexe com dinheiro → MFA obrigatório
+            IF COALESCE(auth.jwt() ->> 'aal', 'aal1') <> 'aal2' THEN
+                RAISE EXCEPTION 'Exceção de cancelamento exige verificação em duas etapas (MFA)';
+            END IF;
+        END IF;
+        IF p_motivo IS NULL OR length(trim(p_motivo)) = 0 THEN
+            RAISE EXCEPTION 'Exceção de cancelamento exige motivo';
+        END IF;
+    END IF;
+
+    -- Regra das 16h: até as 16:00 do dia anterior ao primeiro atendimento → crédito.
+    -- v3.4: calculada no horário do ESTÚDIO, não no timezone da sessão (Ricardo #4)
+    SELECT ((MIN(ri.inicio) AT TIME ZONE 'America/Sao_Paulo')::DATE - 1) + interval '16 hours' INTO v_limite
+    FROM public.reserva_itens ri
+    WHERE ri.reserva_id = p_reserva_id AND ri.estado NOT IN ('cancelado');
+
+    v_regra := CASE WHEN (now() AT TIME ZONE 'America/Sao_Paulo') <= v_limite
+                    THEN 'credito_automatico' ELSE 'perda_automatica' END;
+    v_usuario := public.meu_usuario_id();  -- NULL sob service_role = "sistema"
+
+    UPDATE public.reservas SET estado = 'cancelada'
+    WHERE id = p_reserva_id AND estado IN ('pre_reserva', 'confirmada');
+    IF NOT FOUND THEN RAISE EXCEPTION 'Reserva não pode ser cancelada no estado atual'; END IF;
+
+    UPDATE public.reserva_itens SET estado = 'cancelado'
+    WHERE reserva_id = p_reserva_id AND estado IN ('pendente', 'confirmado');
+
+    UPDATE public.agenda_ocupacoes SET estado = 'cancelada'
+    WHERE origem IN ('pre_reserva', 'reserva') AND origem_id = p_reserva_id AND estado = 'ativa';
+
+    UPDATE public.cobrancas SET estado = 'cancelada'
+    WHERE reserva_id = p_reserva_id AND estado = 'pendente';
+
+    -- v3.4: revisão só quando há DINHEIRO em jogo, e pelo valor efetivamente pago
+    SELECT COALESCE(SUM(t.valor), 0) INTO v_pago
+    FROM public.cobrancas c
+    JOIN public.transacoes t ON t.cobranca_id = c.id
+    WHERE c.reserva_id = p_reserva_id
+      AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total')
+      AND t.estado = 'pago';
+
+    -- v3.4.1 (auditoria #1): desconta o que já está na fila por cancelamentos de
+    -- itens — a fila nunca pode valer mais do que o dinheiro recebido.
+    -- v3.4.1b: revisões decididas 'confirmar' NÃO descontam — o dinheiro voltou à reserva
+    v_pago := v_pago - COALESCE((SELECT SUM(rev.valor_sinal) FROM public.revisoes_cancelamento rev
+                                 WHERE rev.reserva_id = p_reserva_id
+                                   AND rev.decisao_final IS DISTINCT FROM 'confirmar'), 0);
+
+    IF v_pago > 0 THEN
+        INSERT INTO public.revisoes_cancelamento
+            (reserva_id, empresa_id, valor_sinal, regra_aplicada, decisao_final, decidido_por, motivo_decisao)
+        VALUES
+            (p_reserva_id, v_reserva.empresa_id, v_pago, v_regra, p_excecao, v_usuario, p_motivo)
+        ON CONFLICT DO NOTHING;
+
+        IF p_excecao IS NULL THEN
+            PERFORM public.notificar_staff(v_reserva.empresa_id, 'revisao_cancelamento',
+                'Cancelamento com R$ ' || trim(to_char(v_pago, '999990D00')) || ' pago — regra ' ||
+                v_regra || '. Confirme a decisão na fila de revisões.');
+        END IF;
+    END IF;
+
+    IF p_excecao IS NOT NULL THEN
+        INSERT INTO public.log_acoes (empresa_id, tabela, registro_id, acao, usuario_id, perfil, motivo)
+        VALUES (v_reserva.empresa_id, 'reservas', p_reserva_id, 'UPDATE', v_usuario,
+                public.meu_perfil(), 'excecao_cancelamento=' || p_excecao || ': ' || p_motivo);
+    END IF;
+
+    RETURN v_regra;
+END;
+$$;
+
+-- ------------------------------------------------ registrar_pagamento_presencial
+-- v3.4.1:
+--  - ordem de lock global (anti-deadlock): RESERVA → COBRANÇA → transação;
+--  - pagar NÃO marca 'realizada' (auditoria #4) — atendimento realizado é uma
+--    AÇÃO da profissional (finalizar_atendimento), nunca efeito de pagamento;
+--  - pagamento em reserva EXPIRADA/CANCELADA não fica órfão: vira revisão de
+--    pagamento_atrasado + alerta ao staff (auditoria #2), como no webhook;
+--  - MFA: decisão de negócio — o caixa recebe dinheiro ENTRANDO várias vezes ao
+--    dia (risco baixo, tudo auditado); aal2 fica só onde o dinheiro SAI ou muda
+--    de destino (resolver_revisao, exceção de cancelamento).
+CREATE OR REPLACE FUNCTION registrar_pagamento_presencial(
+    p_cobranca_id UUID,
+    p_valor DECIMAL,
+    p_meio TEXT,
+    p_finalidade TEXT,                  -- 'sinal' | 'saldo' | 'pagamento_total'
+    p_idempotencia_key TEXT DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_cobranca RECORD;
+    v_reserva RECORD;
+    v_transacao_id UUID;
+    v_pago DECIMAL(10,2);
+    v_pendente DECIMAL(10,2);
+    v_status TEXT;
+    v_existente UUID;
+BEGIN
+    IF auth.role() = 'authenticated' THEN
+        IF public.meu_perfil() NOT IN ('admin', 'gestor', 'recepcao') THEN
+            RAISE EXCEPTION 'Apenas admin, gestor ou receção registam pagamentos presenciais';
+        END IF;
+    END IF;
+
+    IF p_meio NOT IN ('dinheiro', 'pix', 'cartao_debito', 'cartao_credito') THEN
+        RAISE EXCEPTION 'Meio de pagamento inválido';
+    END IF;
+    IF p_finalidade NOT IN ('sinal', 'saldo', 'pagamento_total') THEN
+        RAISE EXCEPTION 'Finalidade inválida';
+    END IF;
+    IF p_valor IS NULL OR p_valor <= 0 THEN
+        RAISE EXCEPTION 'Valor deve ser positivo';
+    END IF;
+
+    -- Replay idempotente: a chave já existe → devolve a transação original
+    IF p_idempotencia_key IS NOT NULL THEN
+        SELECT id INTO v_existente FROM public.transacoes WHERE mp_idempotency_key = p_idempotencia_key;
+        IF FOUND THEN
+            RETURN jsonb_build_object('transacao_id', v_existente, 'idempotente', true);
+        END IF;
+    END IF;
+
+    -- Leitura sem lock para achar a reserva...
+    SELECT * INTO v_cobranca FROM public.cobrancas WHERE id = p_cobranca_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Cobrança não encontrada'; END IF;
+
+    -- ...ordem de lock global: RESERVA primeiro, COBRANÇA depois
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = v_cobranca.reserva_id FOR UPDATE;
+    SELECT * INTO v_cobranca FROM public.cobrancas WHERE id = p_cobranca_id FOR UPDATE;
+
+    IF auth.role() = 'authenticated' AND v_cobranca.empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+        RAISE EXCEPTION 'Sem permissão para esta empresa';
+    END IF;
+
+    IF v_cobranca.estado IN ('total_pago', 'cancelada') THEN
+        RAISE EXCEPTION 'Cobrança não está aberta (estado: %)', v_cobranca.estado;
+    END IF;
+
+    -- Valor nunca maior que o pendente (Ricardo A4)
+    SELECT COALESCE(SUM(t.valor), 0) INTO v_pago
+    FROM public.transacoes t
+    WHERE t.cobranca_id = p_cobranca_id AND t.estado = 'pago'
+      AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total');
+    v_pendente := (CASE WHEN p_finalidade = 'sinal' THEN v_cobranca.valor_sinal ELSE v_cobranca.valor_total END) - v_pago;
+    IF p_valor > v_pendente THEN
+        RAISE EXCEPTION 'Valor R$ % maior que o pendente (R$ %)', p_valor, v_pendente;
+    END IF;
+
+    INSERT INTO public.transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    VALUES (p_cobranca_id, v_cobranca.empresa_id,
+            COALESCE(p_idempotencia_key, 'presencial-' || gen_random_uuid()::text),
+            p_valor, p_meio, p_finalidade, 'pago')
+    RETURNING id INTO v_transacao_id;
+
+    UPDATE public.cobrancas c
+    SET estado = CASE
+        WHEN p_finalidade = 'pagamento_total' THEN 'total_pago'
+        WHEN (SELECT COALESCE(SUM(t.valor),0) FROM public.transacoes t
+              WHERE t.cobranca_id = c.id AND t.estado = 'pago'
+                AND t.finalidade IN ('sinal','saldo','pagamento_total')) >= c.valor_total THEN 'total_pago'
+        WHEN p_finalidade = 'sinal' THEN 'sinal_pago'
+        ELSE c.estado END
+    WHERE c.id = p_cobranca_id;
+
+    IF p_finalidade IN ('sinal', 'pagamento_total') AND v_reserva.estado = 'pre_reserva' THEN
+        -- Sinal pago no balcão confirma a reserva no mesmo ato (atrasado → fila de revisão)
+        v_status := public.confirmar_reserva(v_reserva.id);
+    ELSIF v_reserva.estado IN ('expirada', 'cancelada') THEN
+        -- v3.4.1 (auditoria #2): dinheiro em reserva morta NUNCA fica órfão
+        IF v_reserva.estado = 'expirada' THEN
+            UPDATE public.reservas SET estado = 'pagamento_em_revisao' WHERE id = v_reserva.id;
+            v_status := 'pagamento_em_revisao';
+        ELSE
+            v_status := v_reserva.estado;  -- cancelada é terminal; o dinheiro vai à fila mesmo assim
+        END IF;
+
+        -- v3.4.1b: a fila é completada até ao pago total (nunca engolida, nunca em dobro)
+        PERFORM public.revisao_completar_fila(v_reserva.id, 'pagamento_atrasado',
+            'Pagamento presencial registado com a reserva ' || v_reserva.estado || ' — confirmar (se couber), estornar ou dar crédito');
+
+        PERFORM public.notificar_staff(v_reserva.empresa_id, 'pagamento_em_revisao',
+            'Pagamento no balcão de R$ ' || trim(to_char(p_valor, '999990D00')) ||
+            ' em reserva ' || v_reserva.estado || ' (' || v_reserva.id::text || '). Decida na fila de revisões.');
+    ELSIF v_reserva.estado = 'pagamento_em_revisao' THEN
+        -- v3.4.1b: dinheiro novo em revisão também ENTRA na fila (antes só notificava)
+        PERFORM public.revisao_completar_fila(v_reserva.id, 'pagamento_atrasado',
+            'Novo pagamento presencial com a reserva em revisão — fila completada');
+        PERFORM public.notificar_staff(v_reserva.empresa_id, 'pagamento_em_revisao',
+            'Novo pagamento no balcão (R$ ' || trim(to_char(p_valor, '999990D00')) ||
+            ') em reserva já em revisão: ' || v_reserva.id::text);
+        v_status := 'pagamento_em_revisao';
+    ELSE
+        -- confirmada/realizada: saldo registado; o ESTADO do atendimento não muda
+        -- por pagamento — 'realizada' é só pela RPC finalizar_atendimento
+        v_status := v_reserva.estado;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'transacao_id', v_transacao_id,
+        'idempotente', false,
+        'cobranca_id', p_cobranca_id,
+        'valor', p_valor,
+        'reserva_id', v_reserva.id,
+        'reserva_status', v_status);
+END;
+$$;
+
+-- --------------------------------------------------------- finalizar_atendimento
+-- v3.4.1 (auditoria #4): 'realizada' passa a ser uma AÇÃO da profissional/equipe
+-- ("atendi esta cliente"), nunca consequência de pagamento.
+CREATE OR REPLACE FUNCTION finalizar_atendimento(p_reserva_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_reserva RECORD;
+BEGIN
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = p_reserva_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Reserva não encontrada'; END IF;
+
+    IF auth.role() = 'authenticated' THEN
+        IF v_reserva.empresa_id IS DISTINCT FROM public.minha_empresa_id()
+           OR public.meu_perfil() NOT IN ('admin', 'gestor', 'recepcao', 'profissional') THEN
+            RAISE EXCEPTION 'Apenas a equipe finaliza atendimentos';
+        END IF;
+    END IF;
+
+    IF v_reserva.estado <> 'confirmada' THEN
+        RAISE EXCEPTION 'Só se finaliza reserva confirmada (estado: %)', v_reserva.estado;
+    END IF;
+
+    UPDATE public.reservas SET estado = 'realizada' WHERE id = p_reserva_id;
+    UPDATE public.reserva_itens SET estado = 'realizado'
+    WHERE reserva_id = p_reserva_id AND estado = 'confirmado';
+END;
+$$;
+
+-- ---------------------------------------------------------- cancelar_pre_reserva
+-- Desistência SEM pagamento: nunca gera revisão
+CREATE OR REPLACE FUNCTION cancelar_pre_reserva(p_reserva_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_reserva RECORD;
+BEGIN
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = p_reserva_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Reserva não encontrada'; END IF;
+
+    IF auth.role() = 'authenticated' AND v_reserva.empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+        RAISE EXCEPTION 'Sem permissão para esta empresa';
+    END IF;
+
+    -- v3.4.1: 'expirada' também limpa por aqui (era um estado sem saída)
+    IF v_reserva.estado NOT IN ('pre_reserva', 'expirada') THEN
+        RAISE EXCEPTION 'Reserva não é uma pré-reserva (estado: %)', v_reserva.estado;
+    END IF;
+
+    UPDATE public.agenda_ocupacoes SET estado = 'cancelada'
+    WHERE origem = 'pre_reserva' AND origem_id = p_reserva_id AND estado = 'ativa';
+    UPDATE public.reserva_itens SET estado = 'cancelado'
+    WHERE reserva_id = p_reserva_id AND estado = 'pendente';
+    UPDATE public.cobrancas SET estado = 'cancelada'
+    WHERE reserva_id = p_reserva_id AND estado = 'pendente';
+    UPDATE public.reservas SET estado = 'cancelada' WHERE id = p_reserva_id;
+END;
+$$;
+
+-- ---------------------------------------------------------- revisar_anamnese (v3.3)
+CREATE OR REPLACE FUNCTION revisar_anamnese(
+    p_anamnese_id UUID,
+    p_estado TEXT                -- 'liberada' | 'requer_avaliacao'
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+BEGIN
+    IF p_estado NOT IN ('liberada', 'requer_avaliacao') THEN
+        RAISE EXCEPTION 'Estado de revisão inválido';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM public.anamneses a
+        WHERE a.id = p_anamnese_id
+          AND a.empresa_id = public.minha_empresa_id()
+          AND (public.meu_perfil() = 'admin' OR a.profissional_revisora_id = public.meu_profissional_id())
+    ) THEN
+        RAISE EXCEPTION 'Anamnese não encontrada ou sem permissão de revisão';
+    END IF;
+
+    UPDATE public.anamneses
+    SET estado = p_estado,
+        profissional_revisora_id = COALESCE(profissional_revisora_id, public.meu_profissional_id()),
+        data_revisao = now()
+    WHERE id = p_anamnese_id;
+END;
+$$;
+
+-- ------------------------------------------------------ regenerar_token_anamnese
+CREATE OR REPLACE FUNCTION regenerar_token_anamnese(p_anamnese_id UUID)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_token TEXT;
+    v_anamnese RECORD;
+    v_inicio TIMESTAMPTZ;
+BEGIN
+    SELECT * INTO v_anamnese FROM public.anamneses WHERE id = p_anamnese_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Anamnese não encontrada'; END IF;
+
+    IF auth.role() = 'authenticated' THEN
+        -- v3.4 (Carlos #3): exige perfil de equipe EXISTENTE, não só tenant correto
+        IF v_anamnese.empresa_id IS DISTINCT FROM public.minha_empresa_id()
+           OR public.meu_perfil() NOT IN ('admin', 'gestor', 'recepcao') THEN
+            RAISE EXCEPTION 'Apenas a equipe pode regenerar tokens de anamnese';
+        END IF;
+    END IF;
+
+    -- Invalida tokens anteriores (o índice parcial garante ≤1 ativo por ficha)
+    UPDATE public.anamnese_tokens
+    SET usado = true, usado_em = now()
+    WHERE anamnese_id = p_anamnese_id AND usado = false;
+
+    -- v3.4 (Carlos #2): o link nunca vive além do próprio agendamento
+    SELECT ri.inicio INTO v_inicio
+    FROM public.reserva_itens ri
+    WHERE ri.id = v_anamnese.reserva_item_id AND ri.estado NOT IN ('cancelado');
+
+    v_token := public.gerar_token_opaco();
+
+    INSERT INTO public.anamnese_tokens (empresa_id, token_hash, anamnese_id, cliente_id, reserva_id, expira_em)
+    SELECT v_anamnese.empresa_id, public.sha256_hex(v_token), p_anamnese_id,
+           v_anamnese.cliente_id, ri.reserva_id,
+           LEAST(ri.inicio, now() + interval '24 hours')
+    FROM public.reserva_itens ri
+    WHERE ri.id = v_anamnese.reserva_item_id;
+
+    -- Ficha avulsa (sem item): 24h padrão
+    IF NOT FOUND THEN
+        INSERT INTO public.anamnese_tokens (empresa_id, token_hash, anamnese_id, cliente_id, expira_em)
+        VALUES (v_anamnese.empresa_id, public.sha256_hex(v_token), p_anamnese_id,
+                v_anamnese.cliente_id, now() + interval '24 hours');
+    END IF;
+
+    RETURN v_token;
+END;
+$$;
+
+-- ----------------------------------------------------------- expirar_pre_reservas
+-- v3.4: SKIP LOCKED (Ricardo A1) + estado próprio 'expirada'
+-- v3.4.1 (auditoria: "parcial vencido prendendo o horário"): nenhuma pré-reserva
+-- vencida fica PRESa — o destino depende do dinheiro que entrou:
+--   ZERO pagamento   → 'expirada' (slot livre, fim);
+--   PARCIAL ou TOTAL → 'pagamento_em_revisao' + revisão + alerta (slot livre TAMBÉM;
+--                      o dinheiro espera decisão humana — confirmar/estorno/crédito/perdido).
+CREATE OR REPLACE FUNCTION expirar_pre_reservas(p_limite INT DEFAULT 200)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_r RECORD;
+    v_count INT := 0;
+    v_pago DECIMAL(10,2);
+BEGIN
+    FOR v_r IN
+        SELECT r.id, r.empresa_id
+        FROM public.reservas r
+        WHERE r.estado = 'pre_reserva'
+          AND EXISTS (
+              SELECT 1 FROM public.agenda_ocupacoes o
+              WHERE o.origem = 'pre_reserva' AND o.origem_id = r.id
+                AND o.estado = 'ativa' AND o.expires_at < now()
+          )
+        ORDER BY r.id
+        LIMIT p_limite
+        FOR UPDATE OF r SKIP LOCKED   -- confirmar/webhook com a linha? o cron NÃO espera
+    LOOP
+        SELECT COALESCE(SUM(t.valor), 0) INTO v_pago
+        FROM public.cobrancas c
+        JOIN public.transacoes t ON t.cobranca_id = c.id
+        WHERE c.reserva_id = v_r.id
+          AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total')
+          AND t.estado = 'pago';
+
+        -- Em ambos os ramos o slot é LIBERTADO
+        UPDATE public.agenda_ocupacoes SET estado = 'expirada'
+        WHERE origem = 'pre_reserva' AND origem_id = v_r.id AND estado = 'ativa';
+
+        IF v_pago > 0 THEN
+            UPDATE public.reservas SET estado = 'pagamento_em_revisao' WHERE id = v_r.id;
+            -- itens ficam 'pendente': resolver_revisao('confirmar') pode reagendar
+
+            -- v3.4.1b: fila completada pelo helper (idempotente, nunca em dobro)
+            PERFORM public.revisao_completar_fila(v_r.id, 'pagamento_atrasado',
+                'Pré-reserva vencida com pagamento registado — confirmar (se couber), estornar, dar crédito ou marcar perdido');
+
+            PERFORM public.notificar_staff(v_r.empresa_id, 'pagamento_em_revisao',
+                'Pré-reserva ' || v_r.id::text || ' venceu com R$ ' ||
+                trim(to_char(v_pago, '999990D00')) || ' pago. O horário foi libertado. Decida na fila de revisões.');
+        ELSE
+            UPDATE public.reservas SET estado = 'expirada' WHERE id = v_r.id;
+            -- v3.4.1b: itens ficam 'pendente' também aqui (o ramo com pagamento já fazia).
+            -- Assim 'cancelado' significa SEMPRE "alguém cancelou de propósito" e o
+            -- resolver_revisao('confirmar') pode reviver só 'pendente' sem ressuscitar
+            -- itens que a cliente recusou.
+        END IF;
+
+        -- A cobrança fica 'pendente' DE PROPÓSITO: se o PIX atrasado cair, o
+        -- webhook usa-a e a reserva segue para 'pagamento_em_revisao' (010).
+        v_count := v_count + 1;
+    END LOOP;
+    RETURN v_count;
+END;
+$$;
+
+-- =====================================================================
+-- EXECUTE explícito — fim do PUBLIC por defeito
+-- =====================================================================
+REVOKE ALL ON FUNCTION public.criar_pre_reserva(UUID, UUID, JSONB, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.criar_pre_reserva(UUID, UUID, JSONB, TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.cancelar_item_reserva(UUID, TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.cancelar_item_reserva(UUID, TEXT, TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.confirmar_reserva(UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.confirmar_reserva(UUID) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.cancelar_reserva(UUID, TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.cancelar_reserva(UUID, TEXT, TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.registrar_pagamento_presencial(UUID, DECIMAL, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.registrar_pagamento_presencial(UUID, DECIMAL, TEXT, TEXT, TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.cancelar_pre_reserva(UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.cancelar_pre_reserva(UUID) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.finalizar_atendimento(UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.finalizar_atendimento(UUID) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.revisar_anamnese(UUID, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.revisar_anamnese(UUID, TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.regenerar_token_anamnese(UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.regenerar_token_anamnese(UUID) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.expirar_pre_reservas(INT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.expirar_pre_reservas(INT) TO service_role;
+
+
+-- ================================================================
+-- FICHEIRO: 010_workflow_rpc.sql
+-- ================================================================
+
+-- 010_workflow_rpc.sql (v3.4 — NOVO) — o fechamento dos fluxos que as auditorias
+-- apontaram como impeditivos de produção:
+--
+--  1. processar_pagamento_webhook  — pagamento processado NUM SÓ LUGAR ATÔMICO:
+--     dedupe pela caixa de entrada, lock da reserva ANTES de gravar a transação
+--     e decisão (confirma OU revisão) na mesma transação. Acaba a janela de
+--     corrida webhook×cron (Ricardo/Carlos — impeditivo #1).
+--  2. resolver_revisao             — a fila de revisões ganha SAÍDA: credito /
+--     estorno / perdido / confirmar (com re-verificação de disponibilidade).
+--  3. criar_bloqueio_com_conflito  — bloqueio que cancela os agendamentos
+--     afetados (com revisão de valores) em vez de estourar exclusion_violation
+--     (regressão apontada pelo Ricardo).
+--  4. submeter_anamnese            — o CLIENTE entrega a ficha pelo link (token é
+--     a credencial); regras do modelo decidem liberada × requer_avaliacao.
+
+-- ------------------------------------------------- processar_pagamento_webhook
+CREATE OR REPLACE FUNCTION processar_pagamento_webhook(
+    p_origem TEXT,                        -- 'mercado_pago'
+    p_external_event_id TEXT,             -- id único do evento (dedupe)
+    p_valor DECIMAL,
+    p_transacao_id UUID DEFAULT NULL,     -- transação pendente criada ao gerar o PIX
+    p_cobranca_id UUID DEFAULT NULL,      -- fallback: referência externa
+    p_mp_transaction_id TEXT DEFAULT NULL,
+    p_payload JSONB DEFAULT '{}'::JSONB,
+    p_assinatura_verificada BOOLEAN DEFAULT false
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_inbox UUID;
+    v_tx RECORD;
+    v_cobranca RECORD;
+    v_reserva RECORD;
+    v_tx_id UUID;
+    v_pago DECIMAL(10,2);
+    v_atrasado BOOLEAN := false;
+    v_reserva_id_lookup UUID;
+BEGIN
+    -- 1) Dedupe pela caixa de entrada — o MESMO evento nunca processa duas vezes
+    INSERT INTO public.webhook_inbox (empresa_id, origem, external_event_id, payload, assinatura_verificada)
+    SELECT c.empresa_id, p_origem, p_external_event_id, p_payload, p_assinatura_verificada
+    FROM public.cobrancas c
+    WHERE c.id = p_cobranca_id
+       OR c.id = (SELECT t.cobranca_id FROM public.transacoes t WHERE t.id = p_transacao_id)
+    ON CONFLICT (origem, external_event_id) DO NOTHING
+    RETURNING id INTO v_inbox;
+
+    IF v_inbox IS NULL THEN
+        IF EXISTS (SELECT 1 FROM public.webhook_inbox WHERE origem = p_origem AND external_event_id = p_external_event_id) THEN
+            RETURN jsonb_build_object('status', 'duplicado', 'external_event_id', p_external_event_id);
+        END IF;
+        RAISE EXCEPTION 'Cobrança/transação não encontrada para o webhook';
+    END IF;
+
+    -- 2) Assinatura: RAISE faz rollback de TUDO (inclusive a inbox) → o provedor reenvia
+    IF NOT p_assinatura_verificada THEN
+        RAISE EXCEPTION 'Assinatura do webhook não verificada — evento rejeitado';
+    END IF;
+
+    -- 3) Resolve a cobrança SEM lock e trava na ordem global anti-deadlock:
+    --    RESERVA → COBRANÇA → TRANSAÇÃO (a mesma de cancelar_reserva e cia.)
+    IF p_cobranca_id IS NULL AND p_transacao_id IS NOT NULL THEN
+        SELECT t.cobranca_id INTO p_cobranca_id FROM public.transacoes t WHERE t.id = p_transacao_id;
+    END IF;
+    IF p_cobranca_id IS NULL THEN
+        RAISE EXCEPTION 'Webhook sem transação nem cobrança identificada';
+    END IF;
+
+    SELECT c.reserva_id INTO v_reserva_id_lookup FROM public.cobrancas c WHERE c.id = p_cobranca_id;
+    IF v_reserva_id_lookup IS NULL THEN RAISE EXCEPTION 'Cobrança % não encontrada', p_cobranca_id; END IF;
+
+    -- Trava a reserva ANTES de qualquer decisão — o cron (SKIP LOCKED) passa
+    -- direto e re-tenta no próximo ciclo, quando o estado final já estiver gravado
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = v_reserva_id_lookup FOR UPDATE;
+    SELECT * INTO v_cobranca FROM public.cobrancas WHERE id = p_cobranca_id FOR UPDATE;
+
+    -- 4) Liquida a transação pendente (fluxo PIX da Edge) ou insere a nova
+    v_tx_id := NULL;
+    IF p_transacao_id IS NOT NULL THEN
+        SELECT * INTO v_tx FROM public.transacoes t WHERE t.id = p_transacao_id FOR UPDATE;
+        IF FOUND THEN
+            IF v_tx.cobranca_id <> p_cobranca_id THEN
+                RAISE EXCEPTION 'Transação % não pertence à cobrança %', p_transacao_id, p_cobranca_id;
+            END IF;
+            IF v_tx.estado = 'pago' THEN
+                UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+                RETURN jsonb_build_object('status', 'ja_processado', 'transacao_id', v_tx.id);
+            END IF;
+            UPDATE public.transacoes
+            SET estado = 'pago', mp_transaction_id = COALESCE(p_mp_transaction_id, mp_transaction_id),
+                payload_webhook = p_payload
+            WHERE id = v_tx.id;
+            v_tx_id := v_tx.id;
+        END IF;
+    END IF;
+
+    IF v_tx_id IS NULL THEN
+        INSERT INTO public.transacoes (cobranca_id, empresa_id, mp_idempotency_key, mp_transaction_id, valor, meio, finalidade, estado, payload_webhook)
+        SELECT p_cobranca_id, c.empresa_id, 'mp-' || p_external_event_id, p_mp_transaction_id,
+               p_valor, 'pix',
+               -- índice idx_transacao_sinal_pago_unico: UM sinal pago por cobrança.
+               -- Sinal já pago (ou parcela de sinal) → 'saldo'; 100% → 'pagamento_total'.
+               CASE
+                   WHEN EXISTS (SELECT 1 FROM public.transacoes t
+                                WHERE t.cobranca_id = c.id AND t.finalidade = 'sinal' AND t.estado = 'pago')
+                        OR p_valor < c.valor_sinal THEN 'saldo'
+                   WHEN p_valor >= c.valor_total THEN 'pagamento_total'
+                   ELSE 'sinal'
+               END,
+               'pago', p_payload
+        FROM public.cobrancas c WHERE c.id = p_cobranca_id
+        RETURNING id INTO v_tx_id;
+    END IF;
+
+    INSERT INTO public.eventos_pagamento (transacao_id, mp_event_id, tipo_evento, payload, processado)
+    VALUES (v_tx_id, p_external_event_id, 'payment.updated', p_payload, true)
+    ON CONFLICT (mp_event_id) DO NOTHING;
+
+    SELECT COALESCE(SUM(t.valor), 0) INTO v_pago
+    FROM public.transacoes t
+    WHERE t.cobranca_id = p_cobranca_id AND t.estado = 'pago'
+      AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total');
+
+    -- 5) Decisão pelo estado atual da reserva
+    IF v_reserva.estado = 'pre_reserva' THEN
+        SELECT EXISTS (
+            SELECT 1 FROM public.agenda_ocupacoes
+            WHERE origem = 'pre_reserva' AND origem_id = v_reserva.id
+              AND (estado = 'expirada' OR (estado = 'ativa' AND expires_at <= now()))
+        ) INTO v_atrasado;
+
+        IF NOT v_atrasado AND v_pago >= COALESCE(v_reserva.valor_sinal_total, 0) THEN
+            -- No prazo: confirma tudo aqui mesmo (mesma transação do webhook)
+            UPDATE public.reservas SET estado = 'confirmada' WHERE id = v_reserva.id;
+            UPDATE public.reserva_itens SET estado = 'confirmado'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+            UPDATE public.agenda_ocupacoes SET origem = 'reserva', expires_at = NULL
+            WHERE origem = 'pre_reserva' AND origem_id = v_reserva.id AND estado = 'ativa';
+            UPDATE public.cobrancas
+            SET estado = CASE WHEN v_pago >= valor_total THEN 'total_pago' ELSE 'sinal_pago' END
+            WHERE id = p_cobranca_id;
+
+            UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+            RETURN jsonb_build_object('status', 'confirmada', 'reserva_id', v_reserva.id, 'transacao_id', v_tx_id);
+        END IF;
+
+        IF NOT v_atrasado THEN
+            -- Pagamento PARCIAL no prazo: fica registado; o restante vem noutro evento
+            UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+            RETURN jsonb_build_object('status', 'parcial_registrado', 'reserva_id', v_reserva.id,
+                                      'transacao_id', v_tx_id, 'pago_ate_agora', v_pago);
+        END IF;
+        -- Atrasado: cai no fluxo de revisão abaixo
+    END IF;
+
+    IF (v_reserva.estado = 'expirada' OR (v_reserva.estado = 'pre_reserva' AND v_atrasado)) AND v_pago > 0 THEN
+        -- ATRASADO: slot livre, dinheiro na fila de revisão
+        UPDATE public.agenda_ocupacoes SET estado = 'expirada'
+        WHERE origem = 'pre_reserva' AND origem_id = v_reserva.id AND estado = 'ativa';
+        UPDATE public.reservas SET estado = 'pagamento_em_revisao' WHERE id = v_reserva.id;
+
+        -- v3.4.1b: fila completada pelo helper (líquido do que já está na fila por item)
+        PERFORM public.revisao_completar_fila(v_reserva.id, 'pagamento_atrasado',
+            'Pagamento identificado após o prazo — confirmar (se o horário estiver livre), estornar, dar crédito ou marcar perdido');
+
+        PERFORM public.notificar_staff(v_reserva.empresa_id, 'pagamento_em_revisao',
+            'Pagamento atrasado na reserva ' || v_reserva.id::text || ' (R$ ' ||
+            trim(to_char(v_pago, '999990D00')) || '). O horário foi liberado. Decida na fila de revisões.');
+
+        UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+        RETURN jsonb_build_object('status', 'pagamento_em_revisao', 'reserva_id', v_reserva.id, 'transacao_id', v_tx_id);
+    END IF;
+
+    IF v_reserva.estado = 'confirmada' THEN
+        -- Pagamento de saldo de reserva já confirmada
+        UPDATE public.cobrancas
+        SET estado = CASE WHEN v_pago >= valor_total THEN 'total_pago' ELSE 'sinal_pago' END
+        WHERE id = p_cobranca_id;
+        UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+        RETURN jsonb_build_object('status', 'saldo_registrado', 'reserva_id', v_reserva.id, 'transacao_id', v_tx_id);
+    END IF;
+
+    IF v_reserva.estado = 'pagamento_em_revisao' THEN
+        -- v3.4.1b: dinheiro novo em revisão também ENTRA na fila (antes só notificava)
+        PERFORM public.revisao_completar_fila(v_reserva.id, 'pagamento_atrasado',
+            'Novo pagamento com a reserva em revisão — fila completada');
+        PERFORM public.notificar_staff(v_reserva.empresa_id, 'pagamento_em_revisao',
+            'Novo pagamento (R$ ' || trim(to_char(p_valor, '999990D00')) || ') em reserva já em revisão: ' || v_reserva.id::text);
+        UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+        RETURN jsonb_build_object('status', 'pagamento_em_revisao', 'reserva_id', v_reserva.id, 'transacao_id', v_tx_id);
+    END IF;
+
+    -- cancelada/realizada/no_show com dinheiro chegando: registra e alerta.
+    -- v3.4.1b (achado F9): o INSERT bruto era engolido pelo índice único quando já
+    -- havia revisão aberta (dinheiro sem rasto) — o helper completa a fila aberta.
+    PERFORM public.revisao_completar_fila(v_reserva.id, 'pagamento_atrasado',
+            'Pagamento recebido com a reserva em estado ' || v_reserva.estado || ' — avaliar estorno/crédito');
+    PERFORM public.notificar_staff(v_reserva.empresa_id, 'pagamento_inesperado',
+        'Pagamento de R$ ' || trim(to_char(p_valor, '999990D00')) || ' em reserva ' || v_reserva.estado || ': ' || v_reserva.id::text);
+    UPDATE public.webhook_inbox SET processado = true WHERE id = v_inbox;
+    RETURN jsonb_build_object('status', 'revisao_manual', 'reserva_id', v_reserva.id, 'transacao_id', v_tx_id);
+END;
+$$;
+
+-- ----------------------------------------------------------- resolver_revisao
+CREATE OR REPLACE FUNCTION resolver_revisao(
+    p_revisao_id UUID,
+    p_decisao TEXT,               -- 'credito' | 'estorno' | 'perdido' | 'confirmar'
+    p_motivo TEXT DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_rev RECORD;
+    v_reserva RECORD;
+    v_item RECORD;
+    v_conta UUID;
+    v_saldo DECIMAL(10,2);
+BEGIN
+    IF p_decisao NOT IN ('credito', 'estorno', 'perdido', 'confirmar') THEN
+        RAISE EXCEPTION 'Decisão inválida: %', p_decisao;
+    END IF;
+
+    IF auth.role() = 'authenticated' THEN
+        IF public.meu_perfil() NOT IN ('admin', 'gestor') THEN
+            RAISE EXCEPTION 'Apenas admin/gestor resolvem revisões';
+        END IF;
+        IF COALESCE(auth.jwt() ->> 'aal', 'aal1') <> 'aal2' THEN
+            RAISE EXCEPTION 'Decisão financeira exige verificação em duas etapas (MFA)';
+        END IF;
+    END IF;
+
+    SELECT * INTO v_rev FROM public.revisoes_cancelamento WHERE id = p_revisao_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Revisão não encontrada'; END IF;
+    IF auth.role() = 'authenticated' AND v_rev.empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+        RAISE EXCEPTION 'Sem permissão para esta empresa';
+    END IF;
+    IF v_rev.decisao_final IS NOT NULL THEN
+        RAISE EXCEPTION 'Revisão já decidida (%) — decisões são finais', v_rev.decisao_final;
+    END IF;
+
+    SELECT * INTO v_reserva FROM public.reservas WHERE id = v_rev.reserva_id FOR UPDATE;
+
+    -- ===================== CONFIRMAR (só pagamento atrasado) =====================
+    IF p_decisao = 'confirmar' THEN
+        IF v_reserva.estado <> 'pagamento_em_revisao' THEN
+            RAISE EXCEPTION 'Só se pode confirmar reserva em pagamento_em_revisao (estado: %)', v_reserva.estado;
+        END IF;
+
+        -- v3.4.1 (auditoria #5): PIX que cai 3 dias depois não reagenda o passado
+        IF EXISTS (SELECT 1 FROM public.reserva_itens ri
+                   WHERE ri.reserva_id = v_reserva.id AND ri.inicio <= now()) THEN
+            RAISE EXCEPTION 'O horário desta reserva já passou — escolha estorno ou crédito';
+        END IF;
+
+        -- v3.4.1b: revive só 'pendente'. Desde que o cron deixou de cancelar itens,
+        -- 'cancelado' significa SEMPRE desistência deliberada — esses NÃO voltam.
+        -- Re-verifica disponibilidade do slot original (outro cliente pode ter
+        -- ocupado o horário liberado — Carlos #5)
+        FOR v_item IN SELECT * FROM public.reserva_itens
+                      WHERE reserva_id = v_reserva.id AND estado = 'pendente' LOOP
+            IF EXISTS (SELECT 1 FROM public.agenda_ocupacoes o
+                       WHERE o.estado = 'ativa' AND o.profissional_id = v_item.profissional_id
+                         AND o.periodo && tstzrange(v_item.inicio, v_item.fim, '[)')) THEN
+                RAISE EXCEPTION 'Horário de % já foi ocupado por outro agendamento — escolha estorno ou crédito',
+                    to_char(v_item.inicio AT TIME ZONE 'America/Sao_Paulo', 'DD/MM HH24:MI');
+            END IF;
+            IF EXISTS (SELECT 1 FROM public.agenda_ocupacoes o
+                       WHERE o.estado = 'ativa' AND o.recurso_id = v_item.recurso_id
+                         AND o.periodo && tstzrange(v_item.inicio, v_item.fim, '[)')) THEN
+                RAISE EXCEPTION 'Recurso do horário de % ocupado — escolha estorno ou crédito',
+                    to_char(v_item.inicio AT TIME ZONE 'America/Sao_Paulo', 'DD/MM HH24:MI');
+            END IF;
+        END LOOP;
+
+        -- Recria as ocupações (as antigas estão 'expirada' — não conflitam)
+        FOR v_item IN SELECT * FROM public.reserva_itens
+                      WHERE reserva_id = v_reserva.id AND estado = 'pendente' LOOP
+            INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, recurso_id, reserva_item_id, inicio, fim, origem, origem_id, estado)
+            VALUES (v_reserva.empresa_id, 'recurso', v_item.recurso_id, v_item.id, v_item.inicio, v_item.fim, 'reserva', v_reserva.id, 'ativa');
+            INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, profissional_id, reserva_item_id, inicio, fim, origem, origem_id, estado)
+            VALUES (v_reserva.empresa_id, 'profissional', v_item.profissional_id, v_item.id, v_item.inicio, v_item.fim, 'reserva', v_reserva.id, 'ativa');
+            UPDATE public.reserva_itens SET estado = 'confirmado' WHERE id = v_item.id;
+        END LOOP;
+
+        UPDATE public.reservas SET estado = 'confirmada' WHERE id = v_reserva.id;
+        UPDATE public.cobrancas c
+        SET estado = CASE WHEN (SELECT COALESCE(SUM(t.valor),0) FROM public.transacoes t
+                                WHERE t.cobranca_id = c.id AND t.estado = 'pago') >= c.valor_total
+                          THEN 'total_pago' ELSE 'sinal_pago' END
+        WHERE c.reserva_id = v_reserva.id;
+
+    -- ===================== CRÉDITO =====================
+    ELSIF p_decisao = 'credito' THEN
+        INSERT INTO public.contas_creditos (cliente_id, empresa_id, tipo)
+        VALUES (v_reserva.cliente_id, v_reserva.empresa_id, 'pago')
+        ON CONFLICT (cliente_id, empresa_id, tipo) DO NOTHING;
+
+        SELECT c.id INTO v_conta FROM public.contas_creditos c
+        WHERE c.cliente_id = v_reserva.cliente_id AND c.empresa_id = v_reserva.empresa_id AND c.tipo = 'pago'
+        FOR UPDATE;
+
+        SELECT COALESCE(SUM(l.valor), 0) INTO v_saldo
+        FROM public.lancamentos_creditos l WHERE l.conta_id = v_conta;
+
+        INSERT INTO public.lancamentos_creditos
+            (conta_id, tipo_lancamento, valor, saldo_apos, idempotencia_key, origem_id, origem_tipo, observacoes)
+        VALUES
+            (v_conta, 'credito_cancelamento', v_rev.valor_sinal, v_saldo + v_rev.valor_sinal,
+             'revisao-' || v_rev.id::text, v_rev.reserva_id, 'revisao_cancelamento',
+             COALESCE(p_motivo, 'Revisão ' || v_rev.regra_aplicada))
+        ON CONFLICT (idempotencia_key) DO NOTHING;
+
+        IF v_reserva.estado = 'pagamento_em_revisao' THEN
+            UPDATE public.reservas SET estado = 'cancelada' WHERE id = v_reserva.id;
+            UPDATE public.reserva_itens SET estado = 'cancelado'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+            UPDATE public.cobrancas SET estado = 'cancelada'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+        END IF;
+
+    -- ===================== ESTORNO =====================
+    ELSIF p_decisao = 'estorno' THEN
+        UPDATE public.transacoes t SET estado = 'estornado'
+        FROM public.cobrancas c
+        WHERE t.cobranca_id = c.id AND c.reserva_id = v_reserva.id
+          AND t.finalidade IN ('sinal', 'saldo', 'pagamento_total') AND t.estado = 'pago';
+
+        -- O estorno real no Mercado Pago é tarefa da Edge Function (fila interna)
+        INSERT INTO public.jobs (empresa_id, tipo, payload)
+        VALUES (v_reserva.empresa_id, 'estorno_mercado_pago',
+                jsonb_build_object('reserva_id', v_reserva.id, 'revisao_id', v_rev.id,
+                                   'valor', v_rev.valor_sinal, 'motivo', p_motivo));
+
+        IF v_reserva.estado = 'pagamento_em_revisao' THEN
+            UPDATE public.reservas SET estado = 'cancelada' WHERE id = v_reserva.id;
+            UPDATE public.reserva_itens SET estado = 'cancelado'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+            UPDATE public.cobrancas SET estado = 'cancelada'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+        END IF;
+
+    -- ===================== PERDIDO (o estúdio fica com o sinal) =====================
+    ELSE
+        IF v_reserva.estado = 'pagamento_em_revisao' THEN
+            UPDATE public.reservas SET estado = 'cancelada' WHERE id = v_reserva.id;
+            UPDATE public.reserva_itens SET estado = 'cancelado'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+            UPDATE public.cobrancas SET estado = 'sinal_pago'
+            WHERE reserva_id = v_reserva.id AND estado = 'pendente';
+        END IF;
+    END IF;
+
+    UPDATE public.revisoes_cancelamento
+    SET decisao_final = p_decisao, decidido_por = public.meu_usuario_id(), motivo_decisao = p_motivo
+    WHERE id = p_revisao_id;
+
+    INSERT INTO public.log_acoes (empresa_id, tabela, registro_id, acao, usuario_id, perfil, motivo)
+    VALUES (v_rev.empresa_id, 'revisoes_cancelamento', p_revisao_id, 'UPDATE',
+            public.meu_usuario_id(), public.meu_perfil(),
+            'decisao=' || p_decisao || COALESCE(': ' || p_motivo, ''));
+
+    RETURN jsonb_build_object('revisao_id', p_revisao_id, 'decisao', p_decisao,
+                              'reserva_id', v_reserva.id,
+                              'reserva_status', (SELECT estado FROM public.reservas WHERE id = v_reserva.id));
+END;
+$$;
+
+-- -------------------------------------------------- criar_bloqueio_com_conflito
+-- Ricardo: bloqueio sobre horário ocupado estourava exclusion_violation crua.
+-- Agora: cancela os itens afetados (com revisão de valores pelo fluxo normal),
+-- cria o bloqueio e enfileira aviso aos clientes.
+CREATE OR REPLACE FUNCTION criar_bloqueio_com_conflito(
+    p_profissional_id UUID,
+    p_inicio TIMESTAMPTZ,
+    p_fim TIMESTAMPTZ,
+    p_tipo TEXT,                     -- 'almoco' | 'folga' | 'imprevisto'
+    p_motivo TEXT,
+    p_recurso_id UUID DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_empresa UUID;
+    v_bloqueio UUID;
+    v_item RECORD;
+    v_reservas UUID[] := '{}';
+    v_count INT := 0;
+BEGIN
+    IF p_tipo NOT IN ('almoco', 'folga', 'imprevisto') THEN
+        RAISE EXCEPTION 'Tipo de bloqueio inválido: %', p_tipo;
+    END IF;
+    IF p_inicio >= p_fim THEN RAISE EXCEPTION 'Início tem de ser antes do fim'; END IF;
+
+    SELECT empresa_id INTO v_empresa FROM public.profissionais WHERE id = p_profissional_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Profissional não encontrada'; END IF;
+
+    IF auth.role() = 'authenticated' THEN
+        IF v_empresa IS DISTINCT FROM public.minha_empresa_id()
+           OR public.meu_perfil() NOT IN ('admin', 'gestor', 'recepcao') THEN
+            RAISE EXCEPTION 'Apenas a equipe pode criar bloqueios';
+        END IF;
+    END IF;
+
+    -- Itens vivos que colidem com o bloqueio (pela ocupaçao ATIVA: real, não estimada)
+    FOR v_item IN
+        SELECT DISTINCT ri.id AS item_id, ri.reserva_id
+        FROM public.reserva_itens ri
+        JOIN public.agenda_ocupacoes o ON o.reserva_item_id = ri.id AND o.estado = 'ativa'
+        JOIN public.reservas r ON r.id = ri.reserva_id
+        WHERE ri.estado IN ('pendente', 'confirmado')
+          AND r.estado IN ('pre_reserva', 'confirmada')
+          AND o.periodo && tstzrange(p_inicio, p_fim, '[)')
+          AND ((o.tipo_ocupacao = 'profissional' AND o.profissional_id = p_profissional_id)
+               OR (p_recurso_id IS NOT NULL AND o.tipo_ocupacao = 'recurso' AND o.recurso_id = p_recurso_id))
+        ORDER BY ri.id
+    LOOP
+        -- Cancela pelo fluxo normal: regra 16h + revisão com o valor pago (Carlos #3)
+        PERFORM public.cancelar_item_reserva(v_item.item_id, NULL,
+            'Bloqueio de agenda (' || p_tipo || '): ' || p_motivo);
+        v_reservas := v_reservas || v_item.reserva_id;
+        v_count := v_count + 1;
+    END LOOP;
+
+    INSERT INTO public.bloqueios (empresa_id, profissional_id, recurso_id, inicio, fim, motivo, tipo)
+    VALUES (v_empresa, p_profissional_id, p_recurso_id, p_inicio, p_fim, p_motivo, p_tipo)
+    RETURNING id INTO v_bloqueio;
+
+    -- Aviso ao cliente sai pela fila (Edge Function envia o WhatsApp)
+    INSERT INTO public.jobs (empresa_id, tipo, payload)
+    SELECT v_empresa, 'notificar_cliente_cancelamento',
+           jsonb_build_object('reserva_id', rid, 'motivo', p_motivo, 'bloqueio_id', v_bloqueio)
+    FROM (SELECT DISTINCT unnest(v_reservas) AS rid) s;
+
+    RETURN jsonb_build_object('bloqueio_id', v_bloqueio,
+                              'itens_cancelados', v_count,
+                              'reservas_afetadas', (SELECT COUNT(DISTINCT rid) FROM (SELECT unnest(v_reservas) AS rid) s));
+END;
+$$;
+
+-- ------------------------------------------------------------ submeter_anamnese
+-- O TOKEN é a credencial: o link chega ao cliente por WhatsApp e basta para
+-- submeter — sem login (a política de segurança é o sigilo do link + expiração).
+CREATE OR REPLACE FUNCTION submeter_anamnese(
+    p_token TEXT,
+    p_respostas JSONB,               -- [{"pergunta_id": "...", "resposta": "..."}]
+    p_consentimento_lgpd BOOLEAN,
+    p_texto_consentimento TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_tok RECORD;
+    v_resp JSONB;
+    v_total INT;
+    v_ok INT;
+    v_faltam INT;
+    v_estado TEXT := 'liberada';
+    v_regra RECORD;
+    v_valor TEXT;
+    v_dispara BOOLEAN;
+BEGIN
+    IF p_consentimento_lgpd IS NOT TRUE THEN
+        RAISE EXCEPTION 'É preciso aceitar o termo de consentimento (LGPD) para enviar a ficha';
+    END IF;
+
+    SELECT t.id AS token_id, t.expira_em AS token_expira_em, a.*
+    INTO v_tok
+    FROM public.anamnese_tokens t
+    JOIN public.anamneses a ON a.id = t.anamnese_id
+    WHERE t.token_hash = public.sha256_hex(p_token)
+      AND t.usado = false
+    FOR UPDATE OF t, a;
+
+    IF NOT FOUND THEN RAISE EXCEPTION 'Link inválido ou já utilizado'; END IF;
+    IF v_tok.token_expira_em <= now() THEN
+        RAISE EXCEPTION 'Este link expirou — peça um novo ao estúdio';
+    END IF;
+    IF v_tok.estado <> 'pendente' THEN
+        RAISE EXCEPTION 'Esta ficha já foi respondida';
+    END IF;
+
+    -- v3.4.1 (menor): ficha de agendamento cancelado/expirado não se responde
+    IF v_tok.reserva_item_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.reserva_itens ri
+        JOIN public.reservas r ON r.id = ri.reserva_id
+        WHERE ri.id = v_tok.reserva_item_id AND r.estado IN ('cancelada', 'expirada')
+    ) THEN
+        RAISE EXCEPTION 'O agendamento ligado a esta ficha já não está ativo — fala com o estúdio';
+    END IF;
+
+    -- Toda pergunta respondida tem de pertencer ao MODELO desta ficha
+    SELECT COUNT(*) INTO v_total FROM jsonb_array_elements(p_respostas);
+    SELECT COUNT(*) INTO v_ok
+    FROM jsonb_array_elements(p_respostas) r
+    JOIN public.modelo_perguntas mp ON mp.id = (r->>'pergunta_id')::UUID AND mp.modelo_id = v_tok.modelo_id;
+    IF v_total IS DISTINCT FROM v_ok THEN
+        RAISE EXCEPTION 'Resposta para pergunta que não pertence a esta ficha';
+    END IF;
+
+    -- Obrigatórias respondidas
+    SELECT COUNT(*) INTO v_faltam
+    FROM public.modelo_perguntas mp
+    WHERE mp.modelo_id = v_tok.modelo_id AND mp.obrigatoria = true
+      AND NOT EXISTS (
+          SELECT 1 FROM jsonb_array_elements(p_respostas) r
+          WHERE (r->>'pergunta_id')::UUID = mp.id AND length(trim(COALESCE(r->>'resposta',''))) > 0
+      );
+    IF v_faltam > 0 THEN
+        RAISE EXCEPTION 'Faltam % pergunta(s) obrigatória(s)', v_faltam;
+    END IF;
+
+    INSERT INTO public.anamnese_respostas (anamnese_id, pergunta_id, resposta)
+    SELECT v_tok.id, (r->>'pergunta_id')::UUID, r->>'resposta'
+    FROM jsonb_array_elements(p_respostas) r;
+
+    -- Regras do modelo: qualquer disparo de 'requer_avaliacao' manda a ficha para a profissional
+    FOR v_regra IN
+        SELECT mp.* FROM public.modelo_perguntas mp
+        WHERE mp.modelo_id = v_tok.modelo_id AND mp.operador IS NOT NULL AND mp.resultado_estado IS NOT NULL
+    LOOP
+        SELECT r->>'resposta' INTO v_valor
+        FROM jsonb_array_elements(p_respostas) r
+        WHERE (r->>'pergunta_id')::UUID = v_regra.id;
+        IF v_valor IS NULL THEN CONTINUE; END IF;
+
+        v_dispara := CASE v_regra.operador
+            WHEN 'igual'      THEN lower(trim(v_valor)) = lower(trim(v_regra.valor_disparador))
+            WHEN 'diferente'  THEN lower(trim(v_valor)) <> lower(trim(v_regra.valor_disparador))
+            WHEN 'contem'     THEN position(lower(trim(v_regra.valor_disparador)) in lower(v_valor)) > 0
+            WHEN 'maior_que'  THEN v_valor ~ '^-?\d+(\.\d+)?$' AND v_regra.valor_disparador ~ '^-?\d+(\.\d+)?$'
+                                    AND v_valor::NUMERIC > v_regra.valor_disparador::NUMERIC
+            WHEN 'menor_que'  THEN v_valor ~ '^-?\d+(\.\d+)?$' AND v_regra.valor_disparador ~ '^-?\d+(\.\d+)?$'
+                                    AND v_valor::NUMERIC < v_regra.valor_disparador::NUMERIC
+            ELSE false END;
+
+        IF v_dispara AND v_regra.resultado_estado = 'requer_avaliacao' THEN
+            v_estado := 'requer_avaliacao';
+        END IF;
+    END LOOP;
+
+    UPDATE public.anamneses
+    SET estado = v_estado,
+        consentimento_lgpd = true,
+        texto_consentimento_aceito = p_texto_consentimento
+    WHERE id = v_tok.id;
+
+    UPDATE public.anamnese_tokens SET usado = true, usado_em = now() WHERE id = v_tok.token_id;
+
+    IF v_estado = 'requer_avaliacao' THEN
+        PERFORM public.notificar_staff(v_tok.empresa_id, 'anamnese_requer_avaliacao',
+            'Ficha de anamnese ' || v_tok.id::text || ' exige avaliação da profissional.');
+    END IF;
+
+    RETURN v_estado;
+END;
+$$;
+
+-- -------------------------------------------------------------- remover_bloqueio
+-- v3.4.1: com o REVOKE em bloqueios (007), a remoção também passa por RPC
+CREATE OR REPLACE FUNCTION remover_bloqueio(p_bloqueio_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+BEGIN
+    IF auth.role() = 'authenticated' THEN
+        IF public.meu_perfil() NOT IN ('admin', 'gestor', 'recepcao') THEN
+            RAISE EXCEPTION 'Apenas a equipe remove bloqueios';
+        END IF;
+    END IF;
+
+    DELETE FROM public.bloqueios b
+    WHERE b.id = p_bloqueio_id
+      AND (auth.role() IS DISTINCT FROM 'authenticated' OR b.empresa_id = public.minha_empresa_id());
+    -- o trigger remover_bloqueio_ocupacoes (004) liberta as ocupações
+
+    IF NOT FOUND THEN RAISE EXCEPTION 'Bloqueio não encontrado'; END IF;
+END;
+$$;
+
+-- =====================================================================
+-- EXECUTE explícito
+-- =====================================================================
+REVOKE ALL ON FUNCTION public.processar_pagamento_webhook(TEXT, TEXT, DECIMAL, UUID, UUID, TEXT, JSONB, BOOLEAN) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.processar_pagamento_webhook(TEXT, TEXT, DECIMAL, UUID, UUID, TEXT, JSONB, BOOLEAN) TO service_role;
+
+REVOKE ALL ON FUNCTION public.resolver_revisao(UUID, TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.resolver_revisao(UUID, TEXT, TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.criar_bloqueio_com_conflito(UUID, TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.criar_bloqueio_com_conflito(UUID, TIMESTAMPTZ, TIMESTAMPTZ, TEXT, TEXT, UUID) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.remover_bloqueio(UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.remover_bloqueio(UUID) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.submeter_anamnese(TEXT, JSONB, BOOLEAN, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.submeter_anamnese(TEXT, JSONB, BOOLEAN, TEXT) TO anon, authenticated, service_role;
+
+
+-- ================================================================
+-- FICHEIRO: 011_cron.sql
+-- ================================================================
+
+-- 011_cron.sql — agendamento REAL da expiração de pré-reservas (a cada 5 min)
+-- pg_cron só existe no Supabase gerido; em ambiente local esta migration é um no-op seguro.
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+        -- Idempotente: re-agendar não duplica o job
+        IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'expirar-pre-reservas') THEN
+            PERFORM cron.unschedule('expirar-pre-reservas');
+        END IF;
+
+        PERFORM cron.schedule(
+            'expirar-pre-reservas',
+            '*/5 * * * *',
+            $cmd$SELECT public.expirar_pre_reservas();$cmd$
+        );
+    ELSE
+        RAISE NOTICE 'pg_cron indisponível neste ambiente — no Supabase: Database → Extensions → pg_cron, depois rode esta migration';
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    -- pg_cron instalado mas sem permissão de agendar (ex.: role não-superuser):
+    -- a migration não pode falhar por causa do agendamento
+    RAISE NOTICE 'Não foi possível agendar o cron (%). Agende manualmente: SELECT cron.schedule(''expirar-pre-reservas'', ''*/5 * * * *'', $cmd$SELECT public.expirar_pre_reservas();$cmd$);', SQLERRM;
+END $$;
+
+-- Conferir depois de aplicar:
+--   SELECT jobid, jobname, schedule, command FROM cron.job WHERE jobname = 'expirar-pre-reservas';
+-- Histórico de execuções:
+--   SELECT * FROM cron.job_run_details WHERE jobid = (SELECT jobid FROM cron.job WHERE jobname = 'expirar-pre-reservas') ORDER BY start_time DESC LIMIT 10;
+
+
+-- ================================================================
+-- FICHEIRO: 012_ultima_entrada.sql
+-- ================================================================
+
+-- 012_ultima_entrada.sql (v3.4.2) — "última entrada": o fechamento é a hora do ÚLTIMO
+-- CLIENTE ENTRAR, não a hora de o serviço acabar (Ricardo, 27/07/2026).
+--
+-- Regra nova (só horários RECORRENTES — empresa e profissional):
+--   1. o INÍCIO tem de estar dentro de um intervalo ativo (abertura ≤ início ≤ fechamento);
+--   2. o FIM pode passar do fechamento APENAS se esse intervalo for o ÚLTIMO do dia
+--      (fechamento = máximo do dia). Intervalos do meio do dia (ex.: manhã 09:00–12:30)
+--      continuam a exigir que o serviço caiba inteiro → almoço protegido.
+--   3. dias de EXCEÇÃO (tipo 'ajuste' no calendário) mantêm a regra antiga: o serviço
+--      tem de caber inteiro — um ajuste é deliberado (ex.: "hoje saio às 15h").
+--
+-- CREATE OR REPLACE: preserva dono e permissões já concedidas. Substitui o corpo da
+-- criar_pre_reserva do 008; o resto do ficheiro 008 (cancelar_item_reserva) não muda.
+CREATE OR REPLACE FUNCTION criar_pre_reserva(
+    p_empresa_id UUID,
+    p_cliente_id UUID,
+    p_itens JSONB,              -- [{servico_id, profissional_id, inicio, cardapio?}]
+    p_idempotencia_key TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE
+    v_reserva_id UUID;
+    v_item JSONB;
+    v_servico RECORD;
+    v_profissional RECORD;
+    v_recurso RECORD;
+    v_cand RECORD;
+    v_exc RECORD;
+    v_item_id UUID;
+    v_inicio TIMESTAMPTZ;
+    v_fim TIMESTAMPTZ;
+    v_local_i TIMESTAMP;        -- horário LOCAL do studio (independe da sessão)
+    v_local_f TIMESTAMP;
+    v_preco DECIMAL(10,2);
+    v_cardapio TEXT;
+    v_dow INT;
+    v_anamnese_id UUID;
+    v_token TEXT;
+    v_anamneses JSONB := '[]'::JSONB;
+    v_total DECIMAL(10,2);
+    v_sinal DECIMAL(10,2);
+    v_pct_reserva INT := NULL;
+    v_ok BOOLEAN;
+BEGIN
+    -- Guarda: autenticado tem de ter vínculo ativo com a empresa
+    IF auth.role() = 'authenticated' THEN
+        IF public.minha_empresa_id() IS NULL THEN
+            RAISE EXCEPTION 'Utilizador sem vínculo ativo';
+        END IF;
+        IF p_empresa_id IS DISTINCT FROM public.minha_empresa_id() THEN
+            RAISE EXCEPTION 'Sem permissão para esta empresa';
+        END IF;
+    END IF;
+
+    -- Idempotência POR EMPRESA
+    SELECT id INTO v_reserva_id FROM public.reservas
+    WHERE empresa_id = p_empresa_id AND idempotencia_key = p_idempotencia_key;
+    IF FOUND THEN
+        RETURN jsonb_build_object(
+            'reserva_id', v_reserva_id, 'idempotente', true,
+            'valor_total', (SELECT valor_total FROM public.reservas WHERE id = v_reserva_id),
+            'valor_sinal', (SELECT valor_sinal_total FROM public.reservas WHERE id = v_reserva_id),
+            'anamneses', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object('anamnese_id', a.id))
+                FROM public.anamneses a
+                WHERE a.empresa_id = p_empresa_id
+                  AND a.id IN (SELECT t.anamnese_id FROM public.anamnese_tokens t WHERE t.reserva_id = v_reserva_id)
+            ), '[]'::JSONB)
+        );
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM public.clientes WHERE id = p_cliente_id AND empresa_id = p_empresa_id) THEN
+        RAISE EXCEPTION 'Cliente não encontrado nesta empresa';
+    END IF;
+
+    IF p_itens IS NULL OR jsonb_array_length(p_itens) = 0 THEN
+        RAISE EXCEPTION 'A reserva precisa de pelo menos um serviço';
+    END IF;
+
+    INSERT INTO public.reservas (empresa_id, cliente_id, estado, percentual_sinal, idempotencia_key)
+    VALUES (p_empresa_id, p_cliente_id, 'pre_reserva', 30, p_idempotencia_key)
+    RETURNING id INTO v_reserva_id;
+
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_itens)
+    LOOP
+        v_item_id := NULL;
+        v_inicio := (v_item->>'inicio')::TIMESTAMPTZ;
+        v_cardapio := COALESCE(v_item->>'cardapio', 'feminino');
+
+        SELECT * INTO v_servico FROM public.servicos
+        WHERE id = (v_item->>'servico_id')::UUID
+          AND empresa_id = p_empresa_id AND ativo = true;
+        IF NOT FOUND THEN RAISE EXCEPTION 'Serviço não encontrado ou inativo'; END IF;
+
+        IF v_servico.anamnese_obrigatoria AND v_servico.modelo_anamnese_id IS NULL THEN
+            RAISE EXCEPTION 'Serviço % exige anamnese, mas não tem modelo configurado', v_servico.nome_tecnico;
+        END IF;
+
+        IF v_inicio <= now() THEN
+            RAISE EXCEPTION 'Não é possível agendar no passado';
+        END IF;
+
+        v_fim := v_inicio + (v_servico.duracao_minutos || ' minutes')::INTERVAL;
+        v_pct_reserva := COALESCE(v_pct_reserva, v_servico.percentual_sinal);
+
+        -- Hora LOCAL do studio: não depende do timezone da sessão (Ricardo)
+        v_local_i := v_inicio AT TIME ZONE 'America/Sao_Paulo';
+        v_local_f := v_fim AT TIME ZONE 'America/Sao_Paulo';
+        v_dow := EXTRACT(DOW FROM v_local_i)::INT; -- 0=domingo
+
+        -- Profissional habilitada, ativa e da empresa
+        SELECT p.* INTO v_profissional
+        FROM public.profissionais p
+        JOIN public.profissional_servicos ps ON ps.profissional_id = p.id
+        WHERE p.id = (v_item->>'profissional_id')::UUID
+          AND p.empresa_id = p_empresa_id
+          AND p.ativo = true
+          AND ps.servico_id = v_servico.id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Profissional não habilitada para este serviço';
+        END IF;
+
+        -- ===== Calendário de exceções na ordem correta (Carlos #8) =====
+        -- 1. Fechamento GERAL (folga/feriado da empresa) bloqueia TUDO
+        IF EXISTS (
+            SELECT 1 FROM public.excecoes_calendario e
+            WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+              AND e.profissional_id IS NULL AND e.tipo IN ('folga', 'feriado')
+        ) THEN
+            RAISE EXCEPTION 'Sem atendimento nesta data (folga ou feriado)';
+        END IF;
+
+        -- 2. Folga da PROFISSIONAL bloqueia só ela
+        IF EXISTS (
+            SELECT 1 FROM public.excecoes_calendario e
+            WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+              AND e.profissional_id = v_profissional.id AND e.tipo IN ('folga', 'feriado')
+        ) THEN
+            RAISE EXCEPTION 'Profissional de folga nesta data';
+        END IF;
+
+        -- 3. Ajuste da profissional SUBSTITUI o horário normal dela
+        --    (v3.4.2: ajuste é deliberado → regra antiga, serviço tem de caber inteiro)
+        SELECT e.abertura, e.fechamento INTO v_exc
+        FROM public.excecoes_calendario e
+        WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+          AND e.profissional_id = v_profissional.id AND e.tipo = 'ajuste'
+        LIMIT 1;
+
+        IF FOUND THEN
+            IF v_exc.abertura IS NULL OR v_exc.fechamento IS NULL THEN
+                RAISE EXCEPTION 'Ajuste de horário sem período definido';
+            END IF;
+            IF v_local_i::TIME < v_exc.abertura OR v_local_f::TIME > v_exc.fechamento THEN
+                RAISE EXCEPTION 'Fora do horário especial da profissional nesta data';
+            END IF;
+        ELSE
+            -- 4. Ajuste da empresa substitui o horário normal da empresa (regra antiga também)
+            SELECT e.abertura, e.fechamento INTO v_exc
+            FROM public.excecoes_calendario e
+            WHERE e.empresa_id = p_empresa_id AND e.data = v_local_i::DATE
+              AND e.profissional_id IS NULL AND e.tipo = 'ajuste'
+            LIMIT 1;
+            IF FOUND THEN
+                IF v_exc.abertura IS NULL OR v_exc.fechamento IS NULL THEN
+                    RAISE EXCEPTION 'Ajuste de horário da empresa sem período definido';
+                END IF;
+                IF v_local_i::TIME < v_exc.abertura OR v_local_f::TIME > v_exc.fechamento THEN
+                    RAISE EXCEPTION 'Fora do horário especial desta data';
+                END IF;
+            ELSE
+                -- 5. Horário recorrente da empresa
+                --    v3.4.2 (Ricardo — "última entrada"): o INÍCIO basta estar dentro do
+                --    intervalo; o FIM só pode passar do fechamento no ÚLTIMO intervalo do dia.
+                IF NOT EXISTS (
+                    SELECT 1 FROM public.horarios_empresa h
+                    WHERE h.empresa_id = p_empresa_id AND h.dia_semana = v_dow AND h.ativo = true
+                      AND v_local_i::TIME >= h.abertura
+                      AND v_local_i::TIME <= h.fechamento
+                      AND (
+                          v_local_f::TIME <= h.fechamento
+                          OR h.fechamento = (
+                              SELECT max(h2.fechamento) FROM public.horarios_empresa h2
+                              WHERE h2.empresa_id = p_empresa_id AND h2.dia_semana = v_dow AND h2.ativo = true
+                          )
+                      )
+                ) THEN
+                    RAISE EXCEPTION 'Fora do horário de funcionamento';
+                END IF;
+            END IF;
+
+            -- Horário recorrente da profissional (só quando não há ajuste dela)
+            -- v3.4.2: mesma regra da "última entrada".
+            IF NOT EXISTS (
+                SELECT 1 FROM public.horarios_profissional h
+                WHERE h.profissional_id = v_profissional.id AND h.dia_semana = v_dow AND h.ativo = true
+                  AND v_local_i::TIME >= h.abertura
+                  AND v_local_i::TIME <= h.fechamento
+                  AND (
+                      v_local_f::TIME <= h.fechamento
+                      OR h.fechamento = (
+                          SELECT max(h2.fechamento) FROM public.horarios_profissional h2
+                          WHERE h2.profissional_id = v_profissional.id AND h2.dia_semana = v_dow AND h2.ativo = true
+                      )
+                  )
+            ) THEN
+                RAISE EXCEPTION 'Profissional não atende neste dia/horário';
+            END IF;
+        END IF;
+        -- ===== fim do calendário =====
+
+        -- Profissional livre (erro claro; EXCLUDE + retry são a rede de segurança)
+        IF EXISTS (
+            SELECT 1 FROM public.agenda_ocupacoes o
+            WHERE o.profissional_id = v_profissional.id
+              AND o.estado = 'ativa'
+              AND o.periodo && tstzrange(v_inicio, v_fim, '[)')
+        ) THEN
+            RAISE EXCEPTION 'Profissional indisponível neste horário';
+        END IF;
+
+        SELECT COALESCE(sc.preco_final, v_servico.preco_base) INTO v_preco
+        FROM public.servico_cardapios sc
+        WHERE sc.servico_id = v_servico.id AND sc.cardapio = v_cardapio AND sc.ativo = true;
+        v_preco := COALESCE(v_preco, v_servico.preco_base);
+
+        -- Mesa com RETRY: se outra transação ganhar a mesa, tenta a seguinte (Carlos #12)
+        v_ok := false;
+        FOR v_cand IN
+            SELECT r.* FROM public.recursos r
+            WHERE r.tipo_recurso_id = v_servico.tipo_recurso_id
+              AND r.empresa_id = p_empresa_id AND r.ativo = true
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.agenda_ocupacoes o
+                  WHERE o.recurso_id = r.id AND o.estado = 'ativa'
+                    AND o.periodo && tstzrange(v_inicio, v_fim, '[)')
+              )
+            ORDER BY r.nome
+        LOOP
+            IF v_item_id IS NULL THEN
+                INSERT INTO public.reserva_itens (
+                    reserva_id, empresa_id, nome_servico, preco_base_utilizado,
+                    preco_final, duracao_reservada, percentual_sinal, valor_sinal,
+                    servico_id, profissional_id, recurso_id, inicio, fim
+                ) VALUES (
+                    v_reserva_id, p_empresa_id, v_servico.nome_tecnico, v_servico.preco_base,
+                    v_preco, v_servico.duracao_minutos, v_servico.percentual_sinal,
+                    ROUND(v_preco * v_servico.percentual_sinal / 100.0, 2),
+                    v_servico.id, v_profissional.id, v_cand.id, v_inicio, v_fim
+                ) RETURNING id INTO v_item_id;
+            ELSE
+                UPDATE public.reserva_itens SET recurso_id = v_cand.id WHERE id = v_item_id;
+            END IF;
+
+            BEGIN
+                INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, recurso_id, reserva_item_id, inicio, fim, origem, origem_id, estado, expires_at)
+                VALUES (p_empresa_id, 'recurso', v_cand.id, v_item_id, v_inicio, v_fim, 'pre_reserva', v_reserva_id, 'ativa', now() + interval '30 minutes');
+                v_ok := true;
+                EXIT;
+            EXCEPTION WHEN exclusion_violation THEN
+                NULL; -- outra transação ficou com esta mesa; tentar a próxima
+            END;
+        END LOOP;
+
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'Nenhum recurso compatível disponível neste horário';
+        END IF;
+
+        -- Ocupação da profissional (concorrência vira mensagem clara — Ricardo)
+        BEGIN
+            INSERT INTO public.agenda_ocupacoes (empresa_id, tipo_ocupacao, profissional_id, reserva_item_id, inicio, fim, origem, origem_id, estado, expires_at)
+            VALUES (p_empresa_id, 'profissional', v_profissional.id, v_item_id, v_inicio, v_fim, 'pre_reserva', v_reserva_id, 'ativa', now() + interval '30 minutes');
+        EXCEPTION WHEN exclusion_violation THEN
+            RAISE EXCEPTION 'Profissional indisponível neste horário';
+        END;
+
+        -- Anamnese: ficha ligada AO ITEM + token bruto devolvido uma única vez
+        IF v_servico.anamnese_obrigatoria THEN
+            INSERT INTO public.anamneses (empresa_id, cliente_id, servico_id, modelo_id, versao_modelo, estado, reserva_item_id, profissional_revisora_id)
+            SELECT p_empresa_id, p_cliente_id, v_servico.id, m.id, m.versao, 'pendente', v_item_id, v_profissional.id
+            FROM public.modelos_anamnese m WHERE m.id = v_servico.modelo_anamnese_id
+            RETURNING id INTO v_anamnese_id;
+
+            v_token := public.gerar_token_opaco();
+
+            INSERT INTO public.anamnese_tokens (empresa_id, token_hash, anamnese_id, cliente_id, reserva_id, expira_em)
+            VALUES (
+                p_empresa_id, public.sha256_hex(v_token),
+                v_anamnese_id, p_cliente_id, v_reserva_id,
+                LEAST(v_inicio, now() + interval '24 hours')
+            );
+
+            v_anamneses := v_anamneses || jsonb_build_object(
+                'anamnese_id', v_anamnese_id,
+                'token', v_token,
+                'expira_em', LEAST(v_inicio, now() + interval '24 hours')
+            );
+        END IF;
+    END LOOP;
+
+    UPDATE public.reservas r SET
+        valor_total = t.total,
+        valor_sinal_total = t.sinal,
+        percentual_sinal = v_pct_reserva
+    FROM (SELECT SUM(preco_final) AS total, SUM(valor_sinal) AS sinal
+          FROM public.reserva_itens WHERE reserva_id = v_reserva_id) t
+    WHERE r.id = v_reserva_id
+    RETURNING r.valor_total, r.valor_sinal_total INTO v_total, v_sinal;
+
+    INSERT INTO public.cobrancas (reserva_id, empresa_id, valor_total, percentual_sinal, valor_sinal)
+    VALUES (v_reserva_id, p_empresa_id, v_total, v_pct_reserva, v_sinal);
+
+    -- v3.4.1 (auditoria #3): sinal ZERO (percentual_sinal = 0 — a configuração da fase
+    -- de agenda vazia) não pode morrer nos 30 min: nasce CONFIRMADA, ocupações sem
+    -- expires_at, sem PIX a esperar. O saldo paga-se no estúdio.
+    IF v_sinal <= 0 THEN
+        UPDATE public.reservas SET estado = 'confirmada' WHERE id = v_reserva_id;
+        UPDATE public.reserva_itens SET estado = 'confirmado'
+        WHERE reserva_id = v_reserva_id AND estado = 'pendente';
+        UPDATE public.agenda_ocupacoes SET origem = 'reserva', expires_at = NULL
+        WHERE origem = 'pre_reserva' AND origem_id = v_reserva_id AND estado = 'ativa';
+    END IF;
+
+    RETURN jsonb_build_object(
+        'reserva_id', v_reserva_id,
+        'idempotente', false,
+        'estado', CASE WHEN v_sinal <= 0 THEN 'confirmada' ELSE 'pre_reserva' END,
+        'valor_total', v_total,
+        'valor_sinal', v_sinal,
+        'anamneses', v_anamneses
+    );
+
+EXCEPTION
+    WHEN unique_violation THEN
+        SELECT id INTO v_reserva_id FROM public.reservas
+        WHERE empresa_id = p_empresa_id AND idempotencia_key = p_idempotencia_key;
+        IF FOUND THEN
+            RETURN jsonb_build_object('reserva_id', v_reserva_id, 'idempotente', true, 'anamneses', '[]'::JSONB);
+        END IF;
+        RAISE;
+    WHEN exclusion_violation THEN
+        RAISE EXCEPTION 'Esse horário acabou de ser preenchido por outro cliente. Tenta outro horário.';
+END;
+$$;
+
+
+-- ================================================================
+-- FICHEIRO: seed.sql
+-- ================================================================
+
+-- seed.sql — dados iniciais ELLA Studio (Valinhos)
+-- v3.3 (Ricardo #7): horário da Laira dividido em DOIS intervalos — almoço 12:30–13:30 protegido
+
+INSERT INTO empresas (id, nome, cnpj, telefone, endereco) VALUES
+('00000000-0000-0000-0000-000000000001', 'ELLA Studio', 'XX.XXX.XXX/0001-XX', '5519987480336', 'Santa Gertrudes, Valinhos - SP, CEP 13277-248');
+
+INSERT INTO tipos_recurso (id, empresa_id, nome, descricao) VALUES
+('11111111-1111-1111-1111-111111111111', '00000000-0000-0000-0000-000000000001', 'mesa_manicure', 'Mesa para manicure e serviços de unhas'),
+('11111111-1111-1111-1111-111111111112', '00000000-0000-0000-0000-000000000001', 'cadeira_pedicure', 'Cadeira para pedicure e spa dos pés'),
+('11111111-1111-1111-1111-111111111113', '00000000-0000-0000-0000-000000000001', 'cadeira_cilios', 'Cadeira para cílios e sobrancelhas'),
+('11111111-1111-1111-1111-111111111114', '00000000-0000-0000-0000-000000000001', 'sala_estetica', 'Sala com maca para massagem, depilação e limpeza de pele');
+
+INSERT INTO recursos (id, empresa_id, tipo_recurso_id, nome) VALUES
+('22222222-2222-2222-2222-222222222221', '00000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'Mesa 1'),
+('22222222-2222-2222-2222-222222222222', '00000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'Mesa 2'),
+('22222222-2222-2222-2222-222222222223', '00000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111112', 'Cadeira Pés 1'),
+('22222222-2222-2222-2222-222222222224', '00000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111113', 'Cadeira Cílios 1'),
+('22222222-2222-2222-2222-222222222225', '00000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111114', 'Sala 1');
+
+INSERT INTO profissionais (id, empresa_id, nome, bio) VALUES
+('33333333-3333-3333-3333-333333333333', '00000000-0000-0000-0000-000000000001', 'Laira', 'Fundadora e profissional principal');
+
+-- Empresa: ter–sex 09:00–17:00 contínuo, sábado 09:00–13:00
+INSERT INTO horarios_empresa (empresa_id, dia_semana, abertura, fechamento) VALUES
+('00000000-0000-0000-0000-000000000001', 2, '09:00', '17:00'),
+('00000000-0000-0000-0000-000000000001', 3, '09:00', '17:00'),
+('00000000-0000-0000-0000-000000000001', 4, '09:00', '17:00'),
+('00000000-0000-0000-0000-000000000001', 5, '09:00', '17:00'),
+('00000000-0000-0000-0000-000000000001', 6, '09:00', '13:00');
+
+-- Laira: ter–sex em DOIS intervalos (almoço 12:30–13:30 NÃO é agendável), sábado 09:00–13:00
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('33333333-3333-3333-3333-333333333333', 2, '09:00', '12:30'),
+('33333333-3333-3333-3333-333333333333', 2, '13:30', '17:00'),
+('33333333-3333-3333-3333-333333333333', 3, '09:00', '12:30'),
+('33333333-3333-3333-3333-333333333333', 3, '13:30', '17:00'),
+('33333333-3333-3333-3333-333333333333', 4, '09:00', '12:30'),
+('33333333-3333-3333-3333-333333333333', 4, '13:30', '17:00'),
+('33333333-3333-3333-3333-333333333333', 5, '09:00', '12:30'),
+('33333333-3333-3333-3333-333333333333', 5, '13:30', '17:00'),
+('33333333-3333-3333-3333-333333333333', 6, '09:00', '13:00');

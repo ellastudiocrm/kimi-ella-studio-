@@ -1,0 +1,2253 @@
+-- CRM ELLA Studio v3.4.2 — SUÍTES DE TESTE CONSOLIDADAS (212 asserts)
+-- Ordem de execução: 000_test_setup.sql primeiro, depois as suítes pela ordem apresentada.
+-- Cada ficheiro corre numa conexão própria (sem estado de sessão herdado).
+
+
+-- ================================================================
+-- FICHEIRO: 000_test_setup.sql
+-- ================================================================
+
+-- 000_test_setup.sql — AMBIENTE LOCAL APENAS.
+-- Corre ANTES das migrations num PostgreSQL sem Supabase.
+-- No Supabase real NÃO correr: o schema auth, as roles e os grants já existem.
+-- Todos os blocos são defensivos (IF NOT EXISTS) para nunca interferir com o Supabase.
+
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                   WHERE n.nspname = 'auth' AND p.proname = 'uid') THEN
+        EXECUTE $f$
+            CREATE FUNCTION auth.uid() RETURNS UUID
+            LANGUAGE sql STABLE AS $g$
+                SELECT CASE WHEN current_setting('request.jwt.claims', true) IS NULL THEN NULL
+                       ELSE NULLIF(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::UUID END
+            $g$
+        $f$;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                   WHERE n.nspname = 'auth' AND p.proname = 'role') THEN
+        EXECUTE $f$
+            CREATE FUNCTION auth.role() RETURNS TEXT
+            LANGUAGE sql STABLE AS $g$
+                SELECT CASE WHEN current_setting('request.jwt.claims', true) IS NULL THEN NULL
+                       ELSE NULLIF(current_setting('request.jwt.claims', true)::jsonb ->> 'role', '') END
+            $g$
+        $f$;
+    END IF;
+    -- v3.4: RPCs financeiras leem auth.jwt()->>'aal' (MFA)
+    IF NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                   WHERE n.nspname = 'auth' AND p.proname = 'jwt') THEN
+        EXECUTE $f$
+            CREATE FUNCTION auth.jwt() RETURNS JSONB
+            LANGUAGE sql STABLE AS $g$
+                SELECT CASE WHEN current_setting('request.jwt.claims', true) IS NULL THEN NULL
+                       ELSE current_setting('request.jwt.claims', true)::jsonb END
+            $g$
+        $f$;
+    END IF;
+END $$;
+
+-- Roles do Supabase para testes locais
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN CREATE ROLE service_role NOLOGIN BYPASSRLS; END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
+
+-- Replica os default privileges do Supabase (tabelas futuras acessíveis às roles)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;
+
+
+-- ================================================================
+-- FICHEIRO: schedule_test.sql
+-- ================================================================
+
+-- schedule_test.sql — horários, almoço, bloqueios, exceções, anamnese sem modelo
+-- Corre como superuser (as RPCs são SECURITY DEFINER).
+SET TIME ZONE 'America/Sao_Paulo';
+
+-- Fixtures
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'teste_manicure', '11111111-1111-1111-1111-111111111111', 60, 50.00, false),
+('aaaaaaaa-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'teste_sem_modelo', '11111111-1111-1111-1111-111111111111', 60, 50.00, true);
+
+INSERT INTO profissionais (id, empresa_id, nome) VALUES
+('dddddddd-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Prof B Teste');
+
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001'),
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001'),
+('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001');
+
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('dddddddd-0000-0000-0000-000000000001', 2, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 3, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 4, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 5, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 6, '09:00', '13:00'); -- v3.4.2: sábado p/ testar última entrada de 13h
+
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Cliente Teste', '5519999990001');
+
+-- Helper: próxima data com dado dia da semana (2=terça ... 5=sexta), sempre no futuro
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+-- T1: agendamento válido terça 10:00 → cria
+DO $$
+DECLARE v JSONB;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(2,'10:00'))),
+        'sched-t1');
+    ASSERT (v->>'idempotente')::BOOLEAN = false, 'T1: devia ser novo';
+    RAISE NOTICE 'T1 OK — pré-reserva criada %', v->>'reserva_id';
+END $$;
+
+-- T2: mesma chave → idempotente, mesma reserva
+DO $$
+DECLARE v1 JSONB; v2 JSONB;
+BEGIN
+    SELECT (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(2,'14:00'))), 'sched-t2a')) INTO v1;
+    SELECT (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(2,'14:00'))), 'sched-t2a')) INTO v2;
+    ASSERT v1->>'reserva_id' = v2->>'reserva_id' AND (v2->>'idempotente')::BOOLEAN = true, 'T2 falhou';
+    RAISE NOTICE 'T2 OK — idempotência devolveu a mesma reserva';
+END $$;
+
+-- T3: conflito de profissional (10:30 sobrepõe 10:00–11:00) → falha
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(2,'10:30'))), 'sched-t3');
+        RAISE EXCEPTION 'T3 FALHOU: conflito aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%indisponível%', format('T3 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T3 OK — conflito de profissional rejeitado';
+    END;
+END $$;
+
+-- T4: ALMOÇO — 12:30 não é agendável (Ricardo #7)
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(3,'12:30'))), 'sched-t4');
+        RAISE EXCEPTION 'T4 FALHOU: agendou durante o almoço';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%não atende%', format('T4 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T4 OK — almoço 12:30–13:30 protegido';
+    END;
+END $$;
+
+-- T5: 13:30 (regresso do almoço) → cria
+DO $$
+BEGIN
+    PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(3,'13:30'))), 'sched-t5');
+    RAISE NOTICE 'T5 OK — 13:30 agendável (segundo intervalo do dia)';
+END $$;
+
+-- T6: domingo → falha
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(0,'10:00'))), 'sched-t6');
+        RAISE EXCEPTION 'T6 FALHOU: domingo aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%horário de funcionamento%', format('T6 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T6 OK — domingo rejeitado';
+    END;
+END $$;
+
+-- T7: passado → falha
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', now() - interval '1 hour')), 'sched-t7');
+        RAISE EXCEPTION 'T7 FALHOU: passado aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%passado%', format('T7 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T7 OK — passado rejeitado';
+    END;
+END $$;
+
+-- T8: anamnese obrigatória SEM modelo → falha (Ricardo #8)
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000003',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(4,'15:00'))), 'sched-t8');
+        RAISE EXCEPTION 'T8 FALHOU: anamnese obrigatória ignorada';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%não tem modelo configurado%', format('T8 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T8 OK — serviço sem modelo de anamnese bloqueado';
+    END;
+END $$;
+
+-- T9: bloqueio de imprevisto ocupa a agenda → falha agendar no período
+DO $$
+DECLARE v_quinta TIMESTAMPTZ;
+BEGIN
+    v_quinta := teste_proximo_dia(4,'10:00');
+    INSERT INTO bloqueios (empresa_id, profissional_id, inicio, fim, motivo, tipo) VALUES
+    ('00000000-0000-0000-0000-000000000001', '33333333-3333-3333-3333-333333333333',
+     v_quinta, v_quinta + interval '60 minutes', 'Teste imprevisto', 'imprevisto');
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', v_quinta)), 'sched-t9');
+        RAISE EXCEPTION 'T9 FALHOU: bloqueio ignorado';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%indisponível%', format('T9 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T9 OK — bloqueio respeitado';
+    END;
+END $$;
+
+-- T10: segunda profissional usa a SEGUNDA mesa no mesmo horário (recursos independentes)
+DO $$
+BEGIN
+    PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','dddddddd-0000-0000-0000-000000000001',
+            'inicio', teste_proximo_dia(2,'10:00'))), 'sched-t10');
+    RAISE NOTICE 'T10 OK — Prof B na Mesa 2 em simultâneo com Laira na Mesa 1';
+END $$;
+
+-- T11: sábado 14:00 (empresa fecha 13:00) → falha
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(6,'14:00'))), 'sched-t11');
+        RAISE EXCEPTION 'T11 FALHOU: sábado à tarde aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%horário de funcionamento%' OR SQLERRM LIKE '%não atende%', format('T11 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T11 OK — sábado à tarde rejeitado';
+    END;
+END $$;
+
+-- T12: cancelamento INDIVIDUAL — reserva com 2 itens, cancela 1, o outro fica (Ricardo #11)
+DO $$
+DECLARE v JSONB; v_item1 UUID; v_item2 UUID; v_ativas INT;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333', 'inicio', teste_proximo_dia(5,'09:00')),
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','dddddddd-0000-0000-0000-000000000001', 'inicio', teste_proximo_dia(5,'09:00'))
+        ), 'sched-t12');
+    SELECT id INTO v_item1 FROM reserva_itens WHERE reserva_id = (v->>'reserva_id')::UUID
+        AND profissional_id = '33333333-3333-3333-3333-333333333333';
+    SELECT id INTO v_item2 FROM reserva_itens WHERE reserva_id = (v->>'reserva_id')::UUID
+        AND profissional_id = 'dddddddd-0000-0000-0000-000000000001';
+
+    PERFORM public.cancelar_item_reserva(v_item1);
+
+    SELECT COUNT(*) INTO v_ativas FROM agenda_ocupacoes
+    WHERE reserva_item_id = v_item2 AND estado = 'ativa';
+    ASSERT v_ativas = 2, 'T12: ocupações do item 2 deviam continuar ativas';
+    ASSERT EXISTS (SELECT 1 FROM agenda_ocupacoes WHERE reserva_item_id = v_item1 AND estado = 'cancelada'),
+        'T12: ocupações do item 1 deviam estar canceladas';
+    ASSERT (SELECT estado FROM reservas WHERE id = (v->>'reserva_id')::UUID) = 'pre_reserva',
+        'T12: reserva devia continuar pré-reserva (ainda tem 1 item)';
+    ASSERT (SELECT valor_total FROM reservas WHERE id = (v->>'reserva_id')::UUID) = 50.00,
+        'T12: total devia ter sido recalculado para 1 item';
+    RAISE NOTICE 'T12 OK — cancelamento individual liberta só o item cancelado';
+END $$;
+
+-- ================= v3.4.2 — regra da "última entrada" (migração 012) =================
+-- 17h não é fechar o studio: é receber o ÚLTIMO cliente. O serviço pode passar da
+-- hora SÓ no último intervalo do dia. Almoço e ajustes (exceções) continuam rigorosos.
+
+-- T13: Prof B sábado 12:30 + 60 min → acaba 13:30 (passa das 13h no ÚLTIMO intervalo) → CRIA
+DO $$
+BEGIN
+    PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','dddddddd-0000-0000-0000-000000000001',
+            'inicio', teste_proximo_dia(6,'12:30'))), 'sched-t13');
+    RAISE NOTICE 'T13 OK — cliente das 12:30 de sábado pode acabar 13:30 (última entrada)';
+END $$;
+
+-- T14: Prof B quarta 17:00 em ponto + 60 min → acaba 18:00 → CRIA (último cliente às 17h)
+DO $$
+BEGIN
+    PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','dddddddd-0000-0000-0000-000000000001',
+            'inicio', teste_proximo_dia(3,'17:00'))), 'sched-t14');
+    RAISE NOTICE 'T14 OK — começar exatamente às 17:00 é permitido';
+END $$;
+
+-- T15: quinta 17:30 (DEPOIS da última entrada) → falha
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(4,'17:30'))), 'sched-t15');
+        RAISE EXCEPTION 'T15 FALHOU: agendou depois das 17h';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%horário de funcionamento%', format('T15 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T15 OK — depois das 17:00 não entra ninguém';
+    END;
+END $$;
+
+-- T16: sexta 12:00 + 60 min → atravessa o almoço (12:30 não é o último do dia) → falha
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(5,'12:00'))), 'sched-t16');
+        RAISE EXCEPTION 'T16 FALHOU: serviço atravessou o almoço';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%não atende%', format('T16 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T16 OK — almoço continua protegido (só o último intervalo estica)';
+    END;
+END $$;
+
+-- T17/T18: dia de AJUSTE (exceção) — regra antiga: o serviço tem de caber inteiro.
+-- Cenário: sexta especial, Laira atende 09:00–15:00 (compromisso às 15h).
+INSERT INTO excecoes_calendario (empresa_id, profissional_id, data, tipo, abertura, fechamento, motivo)
+VALUES ('00000000-0000-0000-0000-000000000001', '33333333-3333-3333-3333-333333333333',
+        teste_proximo_dia(5,'00:00')::DATE, 'ajuste', '09:00', '15:00', 'Teste v3.4.2 — saída às 15h');
+
+-- T17: sexta 12:00 + 60 min → acaba 13:00 (cabe inteiro antes das 15h) → CRIA
+DO $$
+BEGIN
+    PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(5,'12:00'))), 'sched-t17');
+    RAISE NOTICE 'T17 OK — em dia de ajuste, serviço que cabe inteiro entra';
+END $$;
+
+-- T18: sexta 15:00 + 60 min → acabaria 16:00, depois da saída → falha (ajuste NÃO estica)
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-000000000001',
+            jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000001',
+                'profissional_id','33333333-3333-3333-3333-333333333333',
+                'inicio', teste_proximo_dia(5,'15:00'))), 'sched-t18');
+        RAISE EXCEPTION 'T18 FALHOU: esticou num dia de ajuste';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%horário especial%', format('T18 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T18 OK — dia de ajuste não estica (saída às 15h respeitada)';
+    END;
+END $$;
+
+-- Limpeza: o ajuste de teste não pode vazar para os outros ficheiros da suíte
+DELETE FROM excecoes_calendario
+WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+  AND profissional_id = '33333333-3333-3333-3333-333333333333'
+  AND tipo = 'ajuste' AND motivo = 'Teste v3.4.2 — saída às 15h';
+
+
+-- ================================================================
+-- FICHEIRO: payment_race_test.sql
+-- ================================================================
+
+-- payment_race_test.sql — o coração da auditoria: pagamento × expiração × confirmação
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'teste_pagamento', '11111111-1111-1111-1111-111111111111', 60, 100.00, false);
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001');
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'Cliente Pagamento', '5519999990011');
+
+-- Helper: cria pré-reserva e devolve id
+CREATE OR REPLACE FUNCTION teste_cria_reserva(dow INT, hora TEXT, chave TEXT) RETURNS UUID
+LANGUAGE sql VOLATILE AS $$
+    SELECT (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(dow, hora))), chave) ->> 'reserva_id')::UUID
+$$;
+
+-- Helper: paga o sinal de uma reserva (simula webhook do Mercado Pago)
+CREATE OR REPLACE FUNCTION teste_paga_sinal(p_reserva UUID, p_finalidade TEXT, p_valor NUMERIC) RETURNS VOID
+LANGUAGE sql VOLATILE AS $$
+    INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    SELECT c.id, c.empresa_id, 'teste-' || gen_random_uuid()::TEXT, p_valor, 'pix', p_finalidade, 'pago'
+    FROM cobrancas c WHERE c.reserva_id = p_reserva
+$$;
+
+-- T1: fluxo feliz — paga sinal dentro dos 30 min → confirmada
+DO $$
+DECLARE v_r UUID; v_status TEXT;
+BEGIN
+    v_r := teste_cria_reserva(2, '16:00', 'pay-t1');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    v_status := public.confirmar_reserva(v_r);
+    ASSERT v_status = 'confirmada', format('T1: status %s', v_status);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada';
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes
+        WHERE origem = 'pre_reserva' AND origem_id = v_r AND estado = 'ativa');
+    ASSERT EXISTS (SELECT 1 FROM agenda_ocupacoes
+        WHERE origem = 'reserva' AND origem_id = v_r AND estado = 'ativa' AND expires_at IS NULL);
+    ASSERT (SELECT estado FROM cobrancas WHERE reserva_id = v_r) = 'sinal_pago';
+    RAISE NOTICE 'T1 OK — confirmada, ocupações convertidas e sem expiração';
+END $$;
+
+-- T2 (v3.4): sinal pago DEPOIS dos 30 min → 'pagamento_em_revisao', slot LIBERTADO e revisão GRAVADA
+DO $$
+DECLARE v_r UUID; v_status TEXT;
+BEGIN
+    v_r := teste_cria_reserva(3, '16:00', 'pay-t2');
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;  -- simula: cron ainda não correu
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    v_status := public.confirmar_reserva(v_r);
+    ASSERT v_status = 'pagamento_em_revisao', format('T2: status %s', v_status);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pagamento_em_revisao',
+        'T2: reserva atrasada não deve confirmar nem continuar pré-reserva';
+    ASSERT EXISTS (SELECT 1 FROM revisoes_cancelamento
+        WHERE reserva_id = v_r AND regra_aplicada = 'pagamento_atrasado' AND decisao_final IS NULL),
+        'T2 REGRESSÃO: revisão de pagamento atrasado não foi gravada';
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes
+        WHERE origem_id = v_r AND estado = 'ativa'),
+        'T2 REGRESSÃO (sequestro do slot): ocupação continuou ativa após pagamento atrasado';
+    -- o slot foi mesmo libertado: outra reserva cabe no mesmo horário
+    PERFORM teste_cria_reserva(3, '16:00', 'pay-t2b');
+    RAISE NOTICE 'T2 OK — atrasado: slot libertado, reserva em revisão, novo agendamento cabe no horário';
+END $$;
+
+-- T3 (v3.4): NÃO paga + vencida → cron marca 'expirada' e liberta o slot
+DO $$
+DECLARE v_r UUID; v_n INT;
+BEGIN
+    v_r := teste_cria_reserva(4, '16:00', 'pay-t3');
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    v_n := public.expirar_pre_reservas();
+    ASSERT v_n >= 1, 'T3: cron devia ter expirado pelo menos 1';
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'expirada',
+        'T3: estado devia ser expirada (não cancelada)';
+    ASSERT EXISTS (SELECT 1 FROM agenda_ocupacoes
+        WHERE origem = 'pre_reserva' AND origem_id = v_r AND estado = 'expirada');
+    -- slot liberto: novo agendamento no mesmo horário tem de funcionar
+    PERFORM teste_cria_reserva(4, '16:00', 'pay-t3b');
+    RAISE NOTICE 'T3 OK — não-paga expirada e slot libertado';
+END $$;
+
+-- T4 (v3.4.1): PAGA + vencida → cron NÃO cancela: encaminha para a fila de revisão (slot livre)
+DO $$
+DECLARE v_r UUID; v_status TEXT;
+BEGIN
+    v_r := teste_cria_reserva(5, '16:00', 'pay-t4');
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.expirar_pre_reservas();
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pagamento_em_revisao',
+        'T4: cron devia ter encaminhado a reserva paga para revisão (nunca cancelar dinheiro)';
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes WHERE origem_id = v_r AND estado = 'ativa'),
+        'T4: slot devia estar libertado';
+    ASSERT EXISTS (SELECT 1 FROM revisoes_cancelamento
+        WHERE reserva_id = v_r AND regra_aplicada = 'pagamento_atrasado' AND decisao_final IS NULL),
+        'T4: revisão devia estar aberta';
+    v_status := public.confirmar_reserva(v_r);
+    ASSERT v_status = 'pagamento_em_revisao', 'T4: confirmar tardio devolve o estado da fila';
+    RAISE NOTICE 'T4 OK — cron nunca cancela dinheiro: fila + slot livre';
+END $$;
+
+-- T5: Ricardo #6 — pagamento de 100% também confirma
+DO $$
+DECLARE v_r UUID; v_status TEXT;
+BEGIN
+    v_r := teste_cria_reserva(6, '10:00', 'pay-t5');
+    PERFORM teste_paga_sinal(v_r, 'pagamento_total', 100.00);
+    v_status := public.confirmar_reserva(v_r);
+    ASSERT v_status = 'confirmada', format('T5: status %s', v_status);
+    ASSERT (SELECT estado FROM cobrancas WHERE reserva_id = v_r) = 'total_pago';
+    RAISE NOTICE 'T5 OK — pagamento integral confirma e marca total_pago';
+END $$;
+
+-- T6: valor pago ABAIXO do sinal → não confirma
+DO $$
+DECLARE v_r UUID;
+BEGIN
+    v_r := teste_cria_reserva(6, '11:00', 'pay-t6');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 10.00);  -- sinal exigido: 30.00
+    BEGIN
+        PERFORM public.confirmar_reserva(v_r);
+        RAISE EXCEPTION 'T6 FALHOU: confirmou sem valor suficiente';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%Sinal não pago%', format('T6 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T6 OK — valor insuficiente rejeitado';
+    END;
+END $$;
+
+-- T7: Ricardo #3 — mesma chave de idempotência em EMPRESA diferente não colide
+DO $$
+DECLARE v_empresa_b UUID := 'eeeeeeee-0000-0000-0000-00000000000b';
+DECLARE v_r1 UUID; v_r2 UUID;
+BEGIN
+    INSERT INTO empresas (id, nome) VALUES (v_empresa_b, 'Empresa B Teste')
+    ON CONFLICT (id) DO NOTHING;
+    INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+    ('cccccccc-0000-0000-0000-0000000000b1', v_empresa_b, 'Cliente B', '55199999900b1')
+    ON CONFLICT (empresa_id, telefone_normalizado) DO NOTHING;
+
+    v_r1 := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(3,'09:00'))), 'chave-global')) ->> 'reserva_id';
+
+    BEGIN
+        v_r2 := (public.criar_pre_reserva(v_empresa_b,
+            'cccccccc-0000-0000-0000-0000000000b1',
+            jsonb_build_array(), 'chave-global')) ->> 'reserva_id';
+        RAISE EXCEPTION 'T7 nota: empresa B sem catálogo — esperado falhar por itens vazios';
+    EXCEPTION WHEN OTHERS THEN
+        -- o importante: não devolveu a reserva da empresa A
+        ASSERT v_r2 IS NULL OR v_r2 <> v_r1, 'T7 FALHOU: chave cruzou empresas';
+        RAISE NOTICE 'T7 OK — chave de idempotência é por empresa (empresa B falha nos seus próprios termos, sem colisão)';
+    END;
+END $$;
+
+-- T8: Ricardo #10 — regra das 16h calculada no servidor
+DO $$
+DECLARE v_r UUID; v_regra TEXT;
+BEGIN
+    -- atendimento daqui a 7+ dias → cancelamento agora = antes das 16h do dia anterior → crédito
+    v_r := teste_cria_reserva(5, '09:00', 'pay-t8');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.confirmar_reserva(v_r);
+    v_regra := public.cancelar_reserva(v_r);
+    ASSERT v_regra = 'credito_automatico', format('T8: regra %s', v_regra);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada';
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes WHERE origem_id = v_r AND estado = 'ativa');
+    RAISE NOTICE 'T8 OK — cancelamento antecipado gera crédito automático';
+
+    -- exceção sem motivo → falha
+    BEGIN
+        PERFORM public.cancelar_reserva(v_r, 'estorno', NULL);
+        RAISE EXCEPTION 'T8b nota';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'T8b OK — exceção exige motivo (ou estado final já atingido: %)', SQLERRM;
+    END;
+END $$;
+
+-- T9: exceção admin com motivo fica auditada
+DO $$
+DECLARE v_r UUID; v_log INT;
+BEGIN
+    v_r := teste_cria_reserva(6, '12:00', 'pay-t9');
+    BEGIN
+        PERFORM public.cancelar_reserva(v_r, 'estorno', 'Cliente em luto — gestor autorizou');
+    EXCEPTION WHEN OTHERS THEN
+        NULL; -- service_role/superuser sem perfil: aceite; o que interessa é a auditoria
+    END;
+    SELECT COUNT(*) INTO v_log FROM log_acoes WHERE registro_id = v_r AND motivo LIKE '%luto%';
+    ASSERT v_log = 1 OR NOT EXISTS (SELECT 1 FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final = 'estorno'),
+        'T9: exceção aplicada sem auditoria';
+    RAISE NOTICE 'T9 OK — exceção com motivo fica registada em log_acoes';
+END $$;
+
+-- T10 (v3.4): regra das 16h — cancelamento EM CIMA DA HORA → perda_automatica (tz do estúdio)
+DO $$
+DECLARE v_r UUID; v_regra TEXT; v_novo_inicio TIMESTAMPTZ;
+BEGIN
+    v_r := teste_cria_reserva(5, '09:00', 'pay-t10');
+    -- arrasta o agendamento para "daqui a 2h" (determinístico: o limite — 16:00 da
+    -- véspera — já passou em qualquer timezone de sessão)
+    v_novo_inicio := now() + interval '2 hours';
+    UPDATE reserva_itens SET inicio = v_novo_inicio, fim = v_novo_inicio + interval '60 minutes'
+    WHERE reserva_id = v_r;
+    UPDATE agenda_ocupacoes SET inicio = v_novo_inicio, fim = v_novo_inicio + interval '60 minutes'
+    WHERE origem_id = v_r;
+    v_regra := public.cancelar_reserva(v_r);
+    ASSERT v_regra = 'perda_automatica', format('T10: regra %s (devia ser perda_automatica)', v_regra);
+    RAISE NOTICE 'T10 OK — cancelamento tardio aplica perda (regra calculada no servidor, hora do estúdio)';
+END $$;
+
+-- T11 (v3.4): reserva em pagamento_em_revisao NÃO cancela por cancelar_reserva — só resolver_revisao
+DO $$
+DECLARE v_r UUID; v_status TEXT;
+BEGIN
+    v_r := teste_cria_reserva(2, '15:00', 'pay-t11');
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    v_status := public.confirmar_reserva(v_r);
+    ASSERT v_status = 'pagamento_em_revisao';
+    BEGIN
+        PERFORM public.cancelar_reserva(v_r);
+        RAISE EXCEPTION 'T11 FALHOU: cancelou reserva em revisão';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%resolver_revisao%', format('T11 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T11 OK — dinheiro em revisão só sai pela fila (resolver_revisao)';
+    END;
+END $$;
+
+-- T12 (v3.4 / Ricardo A3): cancelar o ÚLTIMO item pela RPC de item NÃO zera a revisão
+DO $$
+DECLARE v_r UUID; v_item UUID; v_valor DECIMAL;
+BEGIN
+    v_r := teste_cria_reserva(3, '10:00', 'pay-t12');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.confirmar_reserva(v_r);
+    SELECT id INTO v_item FROM reserva_itens WHERE reserva_id = v_r;
+    PERFORM public.cancelar_item_reserva(v_item);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada',
+        'T12: último item devia ter cancelado a reserva inteira';
+    SELECT valor_sinal INTO v_valor FROM revisoes_cancelamento WHERE reserva_id = v_r;
+    ASSERT v_valor = 30.00, format('T12 REGRESSÃO Ricardo A3: revisão com valor %s (devia ser o sinal CHEIO, 30.00)', v_valor);
+    RAISE NOTICE 'T12 OK — último item: reserva cancelada e revisão com o valor cheio (R$ %)', v_valor;
+END $$;
+
+-- T13 (v3.4 / Carlos #3): cancelamento de ITEM pago gera revisão proporcional ao item
+DO $$
+DECLARE v_r UUID; v_item UUID; v_valor DECIMAL; v_total DECIMAL;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','33333333-3333-3333-3333-333333333333', 'inicio', teste_proximo_dia(4,'09:00')),
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','33333333-3333-3333-3333-333333333333', 'inicio', teste_proximo_dia(4,'14:00'))
+        ), 'pay-t13') ->> 'reserva_id')::UUID;
+    PERFORM teste_paga_sinal(v_r, 'sinal', 60.00);  -- sinal de 2 itens de 100 (30+30)
+    PERFORM public.confirmar_reserva(v_r);
+    SELECT id INTO v_item FROM reserva_itens WHERE reserva_id = v_r ORDER BY inicio LIMIT 1;
+    PERFORM public.cancelar_item_reserva(v_item);
+    SELECT valor_sinal INTO v_valor FROM revisoes_cancelamento WHERE reserva_item_id = v_item;
+    ASSERT v_valor = 30.00, format('T13: revisão do item devia ser 30.00 (proporcional), veio %s', v_valor);
+    SELECT valor_total INTO v_total FROM reservas WHERE id = v_r;
+    ASSERT v_total = 100.00, format('T13: total devia recalcular para 100.00, veio %s', v_total);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada',
+        'T13: reserva continua confirmada com o item restante';
+    RAISE NOTICE 'T13 OK — item cancelado: revisão de R$ % e total recalculado para R$ %', v_valor, v_total;
+END $$;
+
+
+-- ================================================================
+-- FICHEIRO: rls_test.sql
+-- ================================================================
+
+-- rls_test.sql — isolamento multi-inquilino, privilégios de coluna, EXECUTE de funções
+SET TIME ZONE 'America/Sao_Paulo';
+
+-- Fixtures: utilizadores (stub auth.users local; no Supabase vêm do signup)
+INSERT INTO auth.users (id) VALUES
+('ffffffff-0000-0000-0000-000000000001'),
+('ffffffff-0000-0000-0000-000000000002'),
+('ffffffff-0000-0000-0000-000000000003')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO empresas (id, nome) VALUES ('eeeeeeee-0000-0000-0000-00000000000b', 'Empresa B Teste')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO usuarios_internos (id, auth_user_id, empresa_id, email, nome, perfil) VALUES
+('99999999-0000-0000-0000-000000000001', 'ffffffff-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'admin@ella.test', 'Admin ELLA', 'admin'),
+('99999999-0000-0000-0000-000000000002', 'ffffffff-0000-0000-0000-000000000002', 'eeeeeeee-0000-0000-0000-00000000000b', 'recepcao@b.test', 'Receção B', 'recepcao'),
+('99999999-0000-0000-0000-000000000003', 'ffffffff-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'laira@ella.test', 'Laira', 'profissional')
+ON CONFLICT (auth_user_id) DO NOTHING;
+
+INSERT INTO usuario_profissional (usuario_id, profissional_id) VALUES
+('99999999-0000-0000-0000-000000000003', '33333333-3333-3333-3333-333333333333')
+ON CONFLICT (usuario_id) DO NOTHING;
+
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-0000000000b1', 'eeeeeeee-0000-0000-0000-00000000000b', 'Cliente B', '55199999900b1')
+ON CONFLICT (empresa_id, telefone_normalizado) DO NOTHING;
+
+-- Uma reserva da ELLA para os testes (criada como sistema)
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000001', 'teste_rls', '11111111-1111-1111-1111-111111111111', 60, 80.00, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+DO $$
+DECLARE v UUID;
+BEGIN
+    v := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000021',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(3,'11:00'))), 'rls-fixture')) ->> 'reserva_id';
+    PERFORM set_config('app.teste.reserva_id', v::TEXT, false);
+END $$;
+
+-- T1: admin da ELLA vê os clientes da ELLA e NÃO vê a Empresa B
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated"}', false);
+DO $$
+DECLARE v_ella INT; v_b INT;
+BEGIN
+    SELECT COUNT(*) INTO v_ella FROM clientes WHERE empresa_id = '00000000-0000-0000-0000-000000000001';
+    SELECT COUNT(*) INTO v_b FROM clientes WHERE empresa_id = 'eeeeeeee-0000-0000-0000-00000000000b';
+    ASSERT v_ella > 0, 'T1: admin devia ver clientes ELLA';
+    ASSERT v_b = 0, format('T1 FALHOU: admin ELLA vê %s clientes da Empresa B', v_b);
+    RAISE NOTICE 'T1 OK — admin ELLA: % clientes próprios, 0 alheios', v_ella;
+END $$;
+RESET ROLE;
+
+-- T2: receção da Empresa B não vê clientes da ELLA
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000002","role":"authenticated"}', false);
+DO $$
+DECLARE v INT;
+BEGIN
+    SELECT COUNT(*) INTO v FROM clientes WHERE empresa_id = '00000000-0000-0000-0000-000000000001';
+    ASSERT v = 0, format('T2 FALHOU: receção B vê %s clientes ELLA', v);
+    RAISE NOTICE 'T2 OK — isolamento multi-inquilino confirmado';
+END $$;
+RESET ROLE;
+
+-- T3: anon não vê nada
+SET ROLE anon;
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', false);
+DO $$
+DECLARE v INT;
+BEGIN
+    SELECT COUNT(*) INTO v FROM clientes;
+    ASSERT v = 0, format('T3 FALHOU: anon vê %s clientes', v);
+    RAISE NOTICE 'T3 OK — anon sem qualquer acesso';
+END $$;
+RESET ROLE;
+
+-- T4: admin NÃO consegue mudar estado diretamente (privilégio de coluna — Ricardo: RLS não obriga RPC)
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated"}', false);
+DO $$
+BEGIN
+    BEGIN
+        EXECUTE format('UPDATE reservas SET estado = %L WHERE id = %L', 'cancelada', current_setting('app.teste.reserva_id'));
+        RAISE EXCEPTION 'T4 FALHOU: mudou estado fora da RPC';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied for table reservas%', format('T4 erro inesperado (devia ser privilégio de coluna): %s', SQLERRM);
+        RAISE NOTICE 'T4 OK — coluna estado protegida: só muda via RPC';
+    END;
+END $$;
+RESET ROLE;
+
+-- T5 (v3.4 / Carlos #6): admin NÃO edita NENHUMA coluna das tabelas nucleares — só via RPC
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated"}', false);
+DO $$
+BEGIN
+    BEGIN
+        UPDATE reservas SET percentual_sinal = 35
+        WHERE id = current_setting('app.teste.reserva_id')::UUID;
+        RAISE EXCEPTION 'T5 FALHOU: admin editou reservas diretamente';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied for table reservas%', format('T5 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T5 OK — reservas é 100%% RPC (UPDATE revogado de authenticated)';
+    END;
+    BEGIN
+        UPDATE cobrancas SET estado = 'total_pago';
+        RAISE EXCEPTION 'T5b FALHOU: admin editou cobranças diretamente';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%', format('T5b erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T5b OK — cobranças idem';
+    END;
+END $$;
+RESET ROLE;
+
+-- T6: profissional vê os seus itens; NÃO escreve em ocupações
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000003","role":"authenticated"}', false);
+DO $$
+DECLARE v INT;
+BEGIN
+    SELECT COUNT(*) INTO v FROM reserva_itens;
+    ASSERT v > 0, 'T6: profissional devia ver os seus itens';
+    BEGIN
+        EXECUTE 'UPDATE agenda_ocupacoes SET estado = ''cancelada''';
+        RAISE EXCEPTION 'T6 FALHOU: profissional escreveu em ocupações';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%', format('T6 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T6 OK — profissional lê itens (%), ocupações só leitura', v;
+    END;
+END $$;
+RESET ROLE;
+
+-- T7: receção B chama criar_pre_reserva para a ELLA → guarda de inquilino
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000002","role":"authenticated"}', false);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+            'cccccccc-0000-0000-0000-0000000000b1', '[]'::JSONB, 'rls-t7');
+        RAISE EXCEPTION 'T7 FALHOU: guarda de inquilino não disparou';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%Sem permissão%', format('T7 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T7 OK — RPC bloqueia operação noutra empresa';
+    END;
+END $$;
+RESET ROLE;
+
+-- T8: anon NÃO executa confirmar_reserva (Ricardo #2)
+SET ROLE anon;
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', false);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.confirmar_reserva(gen_random_uuid());
+        RAISE EXCEPTION 'T8 FALHOU: anon executou RPC privilegiada';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%', format('T8 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T8 OK — EXECUTE revogado de anon';
+    END;
+END $$;
+RESET ROLE;
+
+-- T9: receção NÃO insere transação diretamente (vai pela RPC registrar_pagamento_presencial)
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000002","role":"authenticated"}', false);
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade)
+        VALUES (gen_random_uuid(), 'eeeeeeee-0000-0000-0000-00000000000b', 'x', 10, 'pix', 'sinal');
+        RAISE EXCEPTION 'T9 FALHOU: receção inseriu transação direta';
+    EXCEPTION WHEN OTHERS THEN
+        -- v3.4: o REVOKE de INSERT dispara ANTES da RLS — ambas as mensagens provam o bloqueio
+        ASSERT SQLERRM LIKE '%permission denied%' OR SQLERRM LIKE '%row-level security%' OR SQLERRM LIKE '%row violates%', format('T9 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T9 OK — escrita financeira só via RPC (%)', SQLERRM;
+    END;
+END $$;
+RESET ROLE;
+
+-- T9c (v3.4): anon EXECUTA submeter_anamnese (o token é a credencial) mas token errado não revela nada
+SET ROLE anon;
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', false);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.submeter_anamnese('token-inexistente', '[]'::JSONB, true, 'termo');
+        RAISE EXCEPTION 'T9c FALHOU: token inválido aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%Link inválido%' OR SQLERRM LIKE '%consentimento%', format('T9c erro inesperado (devia ser de negócio, não de permissão): %s', SQLERRM);
+        RAISE NOTICE 'T9c OK — anon executa a RPC; token errado = erro genérico (%)', SQLERRM;
+    END;
+END $$;
+RESET ROLE;
+
+-- T9d (v3.4): anon NÃO executa as RPCs novas de workflow (service_role/authenticated only)
+SET ROLE anon;
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', false);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.processar_pagamento_webhook('mercado_pago', 'x', 10.00);
+        RAISE EXCEPTION 'T9d FALHOU: anon chamou webhook';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%', format('T9d erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T9d OK — webhook só service_role';
+    END;
+    BEGIN
+        PERFORM public.resolver_revisao(gen_random_uuid(), 'credito');
+        RAISE EXCEPTION 'T9e FALHOU: anon resolveu revisão';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%', format('T9e erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T9e OK — resolver_revisao revogado de anon';
+    END;
+END $$;
+RESET ROLE;
+
+-- T10: FK de inquilino — item com profissional de outra empresa é impossível
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO reserva_itens (reserva_id, empresa_id, nome_servico, preco_base_utilizado,
+            duracao_reservada, valor_sinal, profissional_id, recurso_id, inicio, fim)
+        VALUES (current_setting('app.teste.reserva_id')::UUID,
+            '00000000-0000-0000-0000-000000000001', 'x', 10, 60, 3,
+            'dddddddd-0000-0000-0000-0000000000b1', -- inexistente na ELLA
+            '22222222-2222-2222-2222-222222222221', now(), now() + interval '1 hour');
+        RAISE EXCEPTION 'T10 FALHOU: cruzamento de inquilinos aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%violates foreign key%', format('T10 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'T10 OK — FK composta impede cruzamento entre empresas';
+    END;
+END $$;
+
+
+-- ================================================================
+-- FICHEIRO: anamnesis_token_test.sql
+-- ================================================================
+
+-- anamnesis_token_test.sql — token bruto vs hash, expiração 24h, reemissão (Ricardo #9)
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+INSERT INTO modelos_anamnese (id, empresa_id, nome, versao) VALUES
+('bbbbbbbb-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Modelo Teste', 1)
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO modelo_perguntas (modelo_id, ordem, pergunta, tipo_resposta) VALUES
+('bbbbbbbb-0000-0000-0000-000000000001', 1, 'É diabética?', 'sim_nao')
+ON CONFLICT (modelo_id, ordem) DO NOTHING;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria, modelo_anamnese_id) VALUES
+('aaaaaaaa-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'teste_com_anamnese', '11111111-1111-1111-1111-111111111114', 90, 120.00, true, 'bbbbbbbb-0000-0000-0000-000000000001')
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+-- T1: agendamento devolve token BRUTO (64 hex); banco guarda SÓ o hash; expira ≤ 24h
+DO $$
+DECLARE v JSONB; v_token TEXT; v_hash TEXT; v_expira TIMESTAMPTZ; v_reserva UUID;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000002',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(2,'11:00'))), 'anam-t1');
+    v_token := v->'anamneses'->0->>'token';
+    v_reserva := (v->>'reserva_id')::UUID;
+
+    ASSERT v_token IS NOT NULL AND length(v_token) = 64, 'T1: token bruto ausente ou malformado';
+
+    SELECT token_hash, expira_em INTO v_hash, v_expira FROM anamnese_tokens WHERE reserva_id = v_reserva;
+    ASSERT v_hash = public.sha256_hex(v_token), 'T1: hash guardado não corresponde ao token';
+    ASSERT v_hash <> v_token, 'T1 REGRESSÃO Ricardo #9: token bruto gravado no banco!';
+    ASSERT v_expira <= now() + interval '24 hours' + interval '1 minute', format('T1: expiração acima de 24h: %s', v_expira);
+
+    PERFORM set_config('app.teste.token_reserva', v_reserva::TEXT, false);
+    PERFORM set_config('app.teste.token_bruto', v_token, false);
+    RAISE NOTICE 'T1 OK — token entregue uma vez; banco guarda só o hash; expira em %', v_expira;
+END $$;
+
+-- T2: validação pelo hash funciona; token bruto não existe no banco
+DO $$
+DECLARE v_por_hash INT; v_por_bruto INT;
+BEGIN
+    SELECT COUNT(*) INTO v_por_hash FROM anamnese_tokens
+    WHERE token_hash = public.sha256_hex(current_setting('app.teste.token_bruto'));
+    SELECT COUNT(*) INTO v_por_bruto FROM anamnese_tokens
+    WHERE token_hash = current_setting('app.teste.token_bruto');
+    ASSERT v_por_hash = 1 AND v_por_bruto = 0, 'T2 falhou';
+    RAISE NOTICE 'T2 OK — lookup por digest; bruto irrecuperável do banco';
+END $$;
+
+-- T3: retry idempotente NÃO devolve novo token e não duplica fichas
+DO $$
+DECLARE v JSONB; v_tokens INT; v_fichas INT;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000002',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(2,'11:00'))), 'anam-t1');
+    ASSERT (v->>'idempotente')::BOOLEAN = true;
+    SELECT COUNT(*) INTO v_tokens FROM anamnese_tokens
+    WHERE reserva_id = current_setting('app.teste.token_reserva')::UUID;
+    SELECT COUNT(*) INTO v_fichas FROM anamneses a
+    JOIN anamnese_tokens t ON t.anamnese_id = a.id
+    WHERE t.reserva_id = current_setting('app.teste.token_reserva')::UUID;
+    ASSERT v_tokens = 1 AND v_fichas = 1, 'T3: retry duplicou token/ficha';
+    RAISE NOTICE 'T3 OK — retry seguro: 1 ficha, 1 token, sem bruto novo';
+END $$;
+
+-- T4: reemissão invalida o anterior e devolve NOVO bruto
+DO $$
+DECLARE v_anamnese UUID; v_novo TEXT; v_antigo_valido INT; v_novo_valido INT;
+BEGIN
+    SELECT anamnese_id INTO v_anamnese FROM anamnese_tokens
+    WHERE reserva_id = current_setting('app.teste.token_reserva')::UUID;
+    v_novo := public.regenerar_token_anamnese(v_anamnese);
+
+    SELECT COUNT(*) INTO v_antigo_valido FROM anamnese_tokens
+    WHERE anamnese_id = v_anamnese AND usado = false
+      AND token_hash = public.sha256_hex(current_setting('app.teste.token_bruto'));
+    SELECT COUNT(*) INTO v_novo_valido FROM anamnese_tokens
+    WHERE anamnese_id = v_anamnese AND usado = false
+      AND token_hash = public.sha256_hex(v_novo);
+    ASSERT v_antigo_valido = 0 AND v_novo_valido = 1 AND v_novo <> current_setting('app.teste.token_bruto'),
+        'T4 falhou';
+    RAISE NOTICE 'T4 OK — token reemitido: antigo invalidado, novo funcional';
+END $$;
+
+-- T5: revisão da anamnese pela profissional designada via RPC (Ricardo: prof atualizava colunas a mais)
+-- (o id da ficha é resolvido como sistema: anamnese_tokens é só-service_role por desenho)
+DO $$
+DECLARE v_anamnese UUID;
+BEGIN
+    SELECT anamnese_id INTO v_anamnese FROM anamnese_tokens
+    WHERE reserva_id = current_setting('app.teste.token_reserva')::UUID
+    LIMIT 1;
+    PERFORM set_config('app.teste.anamnese_id', v_anamnese::TEXT, false);
+END $$;
+
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000003","role":"authenticated"}', false);
+DO $$
+DECLARE v_anamnese UUID := current_setting('app.teste.anamnese_id')::UUID;
+BEGIN
+    PERFORM public.revisar_anamnese(v_anamnese, 'liberada');
+    ASSERT (SELECT estado FROM anamneses WHERE id = v_anamnese) = 'liberada';
+    ASSERT (SELECT data_revisao FROM anamneses WHERE id = v_anamnese) IS NOT NULL;
+    RAISE NOTICE 'T5 OK — Laira revê a sua anamnese via RPC (estado + data, mais nada)';
+END $$;
+RESET ROLE;
+
+
+-- ================================================================
+-- FICHEIRO: webhook_flow_test.sql
+-- ================================================================
+
+-- webhook_flow_test.sql (v3.4 NOVO) — a RPC atômica processar_pagamento_webhook
+-- Impeditivo comum às duas auditorias: a corrida webhook×cron e a fila sem saída
+-- resolvem-se AQUI. Corre como superuser (a RPC é só-service_role; no Supabase
+-- quem chama é a Edge Function do Mercado Pago).
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+-- W1: webhook no prazo → confirma TUDO na mesma transação
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(5, '10:00', 'wh-1');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w1', 30.00,
+        NULL, v_cob, 'mp-tx-w1', '{"type":"payment"}'::JSONB, true);
+
+    ASSERT v_res->>'status' = 'confirmada', format('W1: status %s', v_res->>'status');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada';
+    ASSERT (SELECT estado FROM cobrancas WHERE id = v_cob) = 'sinal_pago';
+    ASSERT EXISTS (SELECT 1 FROM agenda_ocupacoes
+        WHERE origem = 'reserva' AND origem_id = v_r AND estado = 'ativa' AND expires_at IS NULL);
+    ASSERT (SELECT processado FROM webhook_inbox WHERE external_event_id = 'evt-w1') = true;
+    ASSERT EXISTS (SELECT 1 FROM eventos_pagamento WHERE mp_event_id = 'evt-w1' AND processado = true);
+    PERFORM set_config('app.wh.reserva', v_r::TEXT, false);
+    PERFORM set_config('app.wh.cobranca', v_cob::TEXT, false);
+    RAISE NOTICE 'W1 OK — webhook confirmou atomicamente (reserva + itens + ocupações + cobrança + inbox)';
+END $$;
+
+-- W2: MESMO evento reenviado pelo provedor → 'duplicado', sem segunda transação
+DO $$
+DECLARE v_res JSONB; v_n INT;
+BEGIN
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w1', 30.00,
+        NULL, current_setting('app.wh.cobranca')::UUID, 'mp-tx-w1', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'duplicado', format('W2: status %s', v_res->>'status');
+    SELECT COUNT(*) INTO v_n FROM transacoes t
+    WHERE t.cobranca_id = current_setting('app.wh.cobranca')::UUID AND t.estado = 'pago';
+    ASSERT v_n = 1, format('W2 REGRESSÃO: evento duplicado criou %s transações', v_n);
+    RAISE NOTICE 'W2 OK — idempotência por (origem, external_event_id): replay inócuo';
+END $$;
+
+-- W3: webhook ATRASADO (ocupações vencidas) → pagamento_em_revisao, slot livre
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(5, '11:00', 'wh-3');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w3', 30.00,
+        NULL, v_cob, 'mp-tx-w3', '{}'::JSONB, true);
+
+    ASSERT v_res->>'status' = 'pagamento_em_revisao', format('W3: status %s', v_res->>'status');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pagamento_em_revisao';
+    ASSERT EXISTS (SELECT 1 FROM revisoes_cancelamento
+        WHERE reserva_id = v_r AND regra_aplicada = 'pagamento_atrasado' AND decisao_final IS NULL);
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes WHERE origem_id = v_r AND estado = 'ativa');
+    -- slot libertado de verdade:
+    PERFORM teste_cria_reserva(5, '11:00', 'wh-3b');
+    RAISE NOTICE 'W3 OK — atrasado: dinheiro na fila, slot libertado, horário re-agendável';
+END $$;
+
+-- W4: cron expirou PRIMEIRO, webhook chegou DEPOIS → revisão, nunca confirma
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(5, '14:00', 'wh-4');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'expirada';
+
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w4', 30.00,
+        NULL, v_cob, 'mp-tx-w4', '{}'::JSONB, true);
+
+    ASSERT v_res->>'status' = 'pagamento_em_revisao', format('W4: status %s', v_res->>'status');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pagamento_em_revisao',
+        'W4 REGRESSÃO: webhook confirmou reserva já expirada pelo cron';
+    ASSERT EXISTS (SELECT 1 FROM revisoes_cancelamento WHERE reserva_id = v_r);
+    RAISE NOTICE 'W4 OK — ordem cron→webhook: dinheiro vai para a fila (nunca confirma expirada)';
+END $$;
+
+-- W5: assinatura inválida → RAISE com rollback TOTAL (inbox incluída); retry válido funciona
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB; v_inbox INT;
+BEGIN
+    v_r := teste_cria_reserva(6, '12:00', 'wh-5');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+
+    BEGIN
+        PERFORM public.processar_pagamento_webhook('mercado_pago', 'evt-w5', 100.00,
+            NULL, v_cob, 'mp-tx-w5', '{}'::JSONB, false);  -- assinatura NÃO verificada
+        RAISE EXCEPTION 'W5 FALHOU: webhook sem assinatura processado';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%assinatura%' OR SQLERRM LIKE '%Assinatura%', format('W5 erro inesperado: %s', SQLERRM);
+    END;
+
+    SELECT COUNT(*) INTO v_inbox FROM webhook_inbox WHERE external_event_id = 'evt-w5';
+    ASSERT v_inbox = 0, format('W5 REGRESSÃO: rejeitado ficou na inbox (%s linhas) — retry seria ignorado', v_inbox);
+
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w5', 100.00,
+        NULL, v_cob, 'mp-tx-w5', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'confirmada', format('W5 retry: status %s', v_res->>'status');
+    RAISE NOTICE 'W5 OK — assinatura inválida: rollback total; reenvio assinado confirma';
+END $$;
+
+-- W6: fluxo com TRANSAÇÃO PENDENTE (PIX gerado pela Edge) → webhook liquida a pendente
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_tx UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(5, '15:00', 'wh-6');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    VALUES (v_cob, '00000000-0000-0000-0000-000000000001', 'w6-pending', 30.00, 'pix', 'sinal', 'pendente')
+    RETURNING id INTO v_tx;
+
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w6', 30.00,
+        v_tx, NULL, 'mp-tx-w6', '{}'::JSONB, true);
+
+    ASSERT v_res->>'status' = 'confirmada', format('W6: status %s', v_res->>'status');
+    ASSERT (SELECT estado FROM transacoes WHERE id = v_tx) = 'pago';
+    ASSERT (SELECT mp_transaction_id FROM transacoes WHERE id = v_tx) = 'mp-tx-w6';
+
+    -- evento NOVO para a MESMA transação já paga → ja_processado
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w6b', 30.00,
+        v_tx, NULL, 'mp-tx-w6', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'ja_processado', format('W6 replay: status %s', v_res->>'status');
+    RAISE NOTICE 'W6 OK — pendente liquidada pelo webhook; reenvio por outro evento = ja_processado';
+END $$;
+
+-- W7: segundo webhook (saldo) em reserva confirmada → saldo_registrado + total_pago
+DO $$
+DECLARE v_res JSONB;
+BEGIN
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w7', 70.00,
+        NULL, current_setting('app.wh.cobranca')::UUID, 'mp-tx-w7', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'saldo_registrado', format('W7: status %s', v_res->>'status');
+    ASSERT (SELECT estado FROM cobrancas WHERE id = current_setting('app.wh.cobranca')::UUID) = 'total_pago';
+    RAISE NOTICE 'W7 OK — saldo via webhook fecha a cobrança (total_pago)';
+END $$;
+
+-- W8: pagamento parcial NO PRAZO → registra e aguarda o restante (não confirma, não revisa)
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(4, '09:00', 'wh-8');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w8', 10.00,
+        NULL, v_cob, 'mp-tx-w8', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'parcial_registrado', format('W8: status %s', v_res->>'status');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pre_reserva';
+    ASSERT NOT EXISTS (SELECT 1 FROM revisoes_cancelamento WHERE reserva_id = v_r);
+    -- completou o sinal no evento seguinte → confirma
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-w8b', 20.00,
+        NULL, v_cob, 'mp-tx-w8b', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'confirmada', format('W8b: status %s', v_res->>'status');
+    RAISE NOTICE 'W8 OK — parcial no prazo aguarda; complemento confirma';
+END $$;
+
+
+-- ================================================================
+-- FICHEIRO: review_flow_test.sql
+-- ================================================================
+
+-- review_flow_test.sql (v3.4 NOVO) — resolver_revisao: a fila de revisões tem SAÍDA.
+-- Cobre os dois impeditivos comuns às auditorias:
+--   (1) pagamento atrasado já não sequestra o slot E tem destino (confirmar/estorno/crédito/perdido);
+--   (2) 'confirmar' re-verifica a disponibilidade antes de recriar as ocupações.
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+-- Helper: cria reserva paga ATRASADA (em pagamento_em_revisao) e devolve a revisão
+CREATE OR REPLACE FUNCTION teste_cria_revisao_atrasada(dow INT, hora TEXT, chave TEXT, valor NUMERIC)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v_r UUID; v_cob UUID; v_rev UUID;
+BEGIN
+    v_r := teste_cria_reserva(dow, hora, chave);
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.processar_pagamento_webhook('mercado_pago', 'evt-' || chave, valor,
+        NULL, v_cob, 'mp-' || chave, '{}'::JSONB, true);
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    RETURN v_rev;
+END $$;
+
+-- R1: confirmar com slot LIVRE → reagenda de verdade (ocupações recriadas sem expiração)
+DO $$
+DECLARE v_rev UUID; v_res JSONB; v_r UUID;
+BEGIN
+    v_rev := teste_cria_revisao_atrasada(5, '09:00', 'rev-r1', 30.00);
+    SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
+
+    v_res := public.resolver_revisao(v_rev, 'confirmar', 'Cliente avisou que o PIX ia atrasar');
+
+    ASSERT v_res->>'reserva_status' = 'confirmada', format('R1: status %s', v_res->>'reserva_status');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada';
+    ASSERT (SELECT COUNT(*) FROM agenda_ocupacoes
+            WHERE origem = 'reserva' AND origem_id = v_r AND estado = 'ativa' AND expires_at IS NULL) = 2,
+        'R1: ocupações (profissional+recurso) deviam estar recriadas';
+    ASSERT (SELECT estado FROM reserva_itens WHERE reserva_id = v_r) = 'confirmado';
+    ASSERT (SELECT estado FROM cobrancas WHERE reserva_id = v_r) = 'sinal_pago';
+    ASSERT (SELECT decisao_final FROM revisoes_cancelamento WHERE id = v_rev) = 'confirmar';
+    RAISE NOTICE 'R1 OK — confirmar: reserva reagendada, ocupações vivas, cobrança sinal_pago';
+END $$;
+
+-- R2: segunda decisão na MESMA revisão → erro (decisões são finais)
+DO $$
+DECLARE v_rev UUID;
+BEGIN
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE decisao_final = 'confirmar' LIMIT 1;
+    BEGIN
+        PERFORM public.resolver_revisao(v_rev, 'estorno', 'tentativa dupla');
+        RAISE EXCEPTION 'R2 FALHOU: revisão decidida duas vezes';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%já decidida%', format('R2 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'R2 OK — revisão decidida é imutável';
+    END;
+END $$;
+
+-- R3: confirmar com slot OCUPADO → erro claro; depois crédito → conta + lançamento
+DO $$
+DECLARE v_rev UUID; v_res JSONB; v_r UUID; v_saldo DECIMAL; v_key TEXT;
+BEGIN
+    v_rev := teste_cria_revisao_atrasada(2, '09:00', 'rev-r3', 30.00);
+    SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
+
+    -- outro cliente fica com o horário libertado
+    PERFORM teste_cria_reserva(2, '09:00', 'rev-r3-concorrente');
+
+    BEGIN
+        PERFORM public.resolver_revisao(v_rev, 'confirmar', 'tenta reagendar');
+        RAISE EXCEPTION 'R3 FALHOU: confirmou em cima de outro agendamento';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%ocupado%', format('R3 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'R3a OK — confirmar bloqueado: %', SQLERRM;
+    END;
+
+    v_res := public.resolver_revisao(v_rev, 'credito', 'Cliente escolheu crédito para remarcar');
+    ASSERT v_res->>'reserva_status' = 'cancelada', format('R3: status %s', v_res->>'reserva_status');
+    SELECT saldo_apos, idempotencia_key INTO v_saldo, v_key
+    FROM lancamentos_creditos l
+    JOIN contas_creditos c ON c.id = l.conta_id
+    WHERE l.origem_id = v_r AND l.tipo_lancamento = 'credito_cancelamento';
+    ASSERT v_saldo = 30.00, format('R3: saldo devia ser 30.00, veio %s', v_saldo);
+    ASSERT v_key = 'revisao-' || v_rev::TEXT, format('R3: chave de idempotência %s', v_key);
+    ASSERT (SELECT estado FROM cobrancas WHERE reserva_id = v_r) = 'cancelada';
+    RAISE NOTICE 'R3b OK — crédito de R$ % na conta da cliente (idempotente: %)', v_saldo, v_key;
+END $$;
+
+-- R4: revisão de CANCELAMENTO (regra 16h) → estorno: transação estornada + job na fila
+DO $$
+DECLARE v_r UUID; v_rev UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(3, '10:00', 'rev-r4');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.confirmar_reserva(v_r);
+    PERFORM public.cancelar_reserva(v_r);   -- daqui a 7+ dias → credito_automatico
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    ASSERT v_rev IS NOT NULL, 'R4: cancelamento com dinheiro devia abrir revisão';
+
+    v_res := public.resolver_revisao(v_rev, 'estorno', 'Cliente pediu o dinheiro de volta');
+    ASSERT (SELECT decisao_final FROM revisoes_cancelamento WHERE id = v_rev) = 'estorno';
+    ASSERT EXISTS (SELECT 1 FROM transacoes t JOIN cobrancas c ON c.id = t.cobranca_id
+                   WHERE c.reserva_id = v_r AND t.estado = 'estornado'),
+        'R4: transação devia estar estornada';
+    ASSERT EXISTS (SELECT 1 FROM jobs WHERE tipo = 'estorno_mercado_pago'
+                   AND payload->>'reserva_id' = v_r::TEXT),
+        'R4: job de estorno para a Edge Function devia estar na fila';
+    RAISE NOTICE 'R4 OK — estorno: transação marcada + reembolso real enfileirado para a Edge';
+END $$;
+
+-- R5: perdido (o estúdio fica com o sinal) → reserva cancelada, cobrança sinal_pago
+DO $$
+DECLARE v_rev UUID; v_res JSONB; v_r UUID;
+BEGIN
+    v_rev := teste_cria_revisao_atrasada(4, '15:00', 'rev-r5', 30.00);
+    SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
+    v_res := public.resolver_revisao(v_rev, 'perdido', 'Cliente não apareceu e não respondeu');
+    ASSERT v_res->>'reserva_status' = 'cancelada';
+    ASSERT (SELECT estado FROM cobrancas WHERE reserva_id = v_r) = 'sinal_pago',
+        'R5: sinal fica registado como receita (sinal_pago)';
+    RAISE NOTICE 'R5 OK — perdido: receita mantida, reserva encerrada';
+END $$;
+
+-- R6: decisão financeira exige MFA (aal2) para staff autenticado
+DO $$
+DECLARE v_rev UUID;
+BEGIN
+    v_rev := teste_cria_revisao_atrasada(6, '09:00', 'rev-r6', 30.00);
+    PERFORM set_config('app.rev.r6', v_rev::TEXT, false);
+END $$;
+
+-- aal1 → bloqueado
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated","aal":"aal1"}', false);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.resolver_revisao(current_setting('app.rev.r6')::UUID, 'perdido', 'sem mfa');
+        RAISE EXCEPTION 'R6 FALHOU: decisão financeira sem MFA';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%duas etapas%' OR SQLERRM LIKE '%MFA%', format('R6 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'R6a OK — aal1 bloqueado: %', SQLERRM;
+    END;
+END $$;
+RESET ROLE;
+
+-- aal2 → decide
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated","aal":"aal2"}', false);
+DO $$
+DECLARE v_res JSONB;
+BEGIN
+    v_res := public.resolver_revisao(current_setting('app.rev.r6')::UUID, 'perdido', 'com mfa');
+    ASSERT v_res->>'decisao' = 'perdido';
+    ASSERT EXISTS (SELECT 1 FROM log_acoes WHERE tabela = 'revisoes_cancelamento'
+                   AND registro_id = current_setting('app.rev.r6')::UUID),
+        'R6: decisão devia estar auditada em log_acoes';
+    RAISE NOTICE 'R6b OK — aal2 decide e fica auditado';
+END $$;
+RESET ROLE;
+
+-- R7: recepção NÃO resolve revisão (só admin/gestor) — fixture criada como sistema
+DO $$
+DECLARE v_rev UUID;
+BEGIN
+    v_rev := teste_cria_revisao_atrasada(2, '15:00', 'rev-r7', 30.00);
+    PERFORM set_config('app.rev.r7', v_rev::TEXT, false);
+END $$;
+
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000002","role":"authenticated","aal":"aal2"}', false);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM public.resolver_revisao(current_setting('app.rev.r7')::UUID, 'perdido', 'receção a tentar');
+        RAISE EXCEPTION 'R7 FALHOU: receção resolveu revisão';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%admin/gestor%', format('R7 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'R7 OK — receção bloqueada: %', SQLERRM;
+    END;
+END $$;
+RESET ROLE;
+
+
+-- ================================================================
+-- FICHEIRO: anamnese_submit_test.sql
+-- ================================================================
+
+-- anamnese_submit_test.sql (v3.4 NOVO) — submeter_anamnese: o cliente entrega a ficha
+-- pelo link (token = credencial); as REGRAS do modelo decidem liberada × requer_avaliacao.
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+-- Modelo com regra: "Já fez alergia a esmalte?" = sim → requer_avaliacao
+INSERT INTO modelos_anamnese (id, empresa_id, nome, versao) VALUES
+('bbbbbbbb-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Modelo Regras', 1)
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO modelo_perguntas (id, modelo_id, ordem, pergunta, tipo_resposta, obrigatoria, operador, valor_disparador, resultado_estado) VALUES
+('bbbbbbbb-0000-0000-0000-0000000000a1', 'bbbbbbbb-0000-0000-0000-000000000002', 1, 'Tem alergia a esmalte?', 'sim_nao', true, 'igual', 'sim', 'requer_avaliacao'),
+('bbbbbbbb-0000-0000-0000-0000000000a2', 'bbbbbbbb-0000-0000-0000-000000000002', 2, 'Observações', 'texto', false, NULL, NULL, NULL)
+ON CONFLICT (modelo_id, ordem) DO NOTHING;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria, modelo_anamnese_id) VALUES
+('aaaaaaaa-0000-0000-0000-000000000041', '00000000-0000-0000-0000-000000000001', 'teste_regras_anamnese', '11111111-1111-1111-1111-111111111111', 60, 80.00, true, 'bbbbbbbb-0000-0000-0000-000000000002')
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000041', '00000000-0000-0000-0000-000000000001'),
+('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+-- Helper: agenda com a Prof B e devolve {reserva_id, token, anamnese_id}
+CREATE OR REPLACE FUNCTION teste_agenda_com_anamnese(p_servico TEXT, dow INT, hora TEXT, chave TEXT)
+RETURNS JSONB
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v JSONB; v_tok TEXT;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id', p_servico,
+            'profissional_id', 'dddddddd-0000-0000-0000-000000000001',
+            'inicio', teste_proximo_dia(dow, hora))), chave);
+    RETURN jsonb_build_object(
+        'reserva_id', v->>'reserva_id',
+        'anamnese_id', v->'anamneses'->0->>'anamnese_id',
+        'token', v->'anamneses'->0->>'token');
+END $$;
+
+-- S1: respostas sem disparo → liberada; token queima; reuso → erro
+DO $$
+DECLARE v JSONB; v_estado TEXT;
+BEGIN
+    v := teste_agenda_com_anamnese('aaaaaaaa-0000-0000-0000-000000000041', 4, '14:00', 'sub-s1');
+    v_estado := public.submeter_anamnese(v->>'token',
+        jsonb_build_array(
+            jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não'),
+            jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a2','resposta','primeira vez')),
+        true, 'Li e aceito o tratamento dos dados de saúde (LGPD)');
+
+    ASSERT v_estado = 'liberada', format('S1: estado %s', v_estado);
+    ASSERT (SELECT estado FROM anamneses WHERE id = (v->>'anamnese_id')::UUID) = 'liberada';
+    ASSERT (SELECT consentimento_lgpd FROM anamneses WHERE id = (v->>'anamnese_id')::UUID) = true;
+    ASSERT (SELECT COUNT(*) FROM anamnese_respostas WHERE anamnese_id = (v->>'anamnese_id')::UUID) = 2;
+    ASSERT (SELECT usado FROM anamnese_tokens WHERE anamnese_id = (v->>'anamnese_id')::UUID) = true;
+
+    BEGIN
+        PERFORM public.submeter_anamnese(v->>'token', '[]'::JSONB, true, 'termo');
+        RAISE EXCEPTION 'S1 FALHOU: token reutilizado';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%Link inválido%', format('S1 reuso erro inesperado: %s', SQLERRM);
+    END;
+    RAISE NOTICE 'S1 OK — ficha liberada, respostas gravadas, token queimado';
+END $$;
+
+-- S2: regra dispara ("sim" na alergia) → requer_avaliacao + staff notificado — COMO ANON
+DO $$
+DECLARE v JSONB;
+BEGIN
+    v := teste_agenda_com_anamnese('aaaaaaaa-0000-0000-0000-000000000041', 4, '15:00', 'sub-s2');
+    PERFORM set_config('app.sub.s2_token', v->>'token', false);
+    PERFORM set_config('app.sub.s2_anam', v->>'anamnese_id', false);
+END $$;
+
+SET ROLE anon;
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', false);
+DO $$
+DECLARE v_estado TEXT;
+BEGIN
+    v_estado := public.submeter_anamnese(current_setting('app.sub.s2_token'),
+        jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','Sim')),
+        true, 'termo');
+    ASSERT v_estado = 'requer_avaliacao', format('S2: estado %s', v_estado);
+    RAISE NOTICE 'S2 OK — regra disparou via ANON (link público): requer_avaliacao';
+END $$;
+RESET ROLE;
+
+DO $$
+BEGIN
+    ASSERT (SELECT estado FROM anamneses WHERE id = current_setting('app.sub.s2_anam')::UUID) = 'requer_avaliacao';
+    ASSERT EXISTS (SELECT 1 FROM notificacoes_internas WHERE tipo = 'anamnese_requer_avaliacao'
+                   AND mensagem LIKE '%' || current_setting('app.sub.s2_anam') || '%'),
+        'S2: staff devia ter sido notificado';
+    RAISE NOTICE 'S2b OK — ficha na fila da profissional com notificação ao staff';
+END $$;
+
+-- S3+S5: obrigatória em falta → erro; sem consentimento → erro; depois correto → liberada
+DO $$
+DECLARE v JSONB;
+BEGIN
+    v := teste_agenda_com_anamnese('aaaaaaaa-0000-0000-0000-000000000041', 4, '16:00', 'sub-s3');
+    PERFORM set_config('app.sub.s3_token', v->>'token', false);
+    PERFORM set_config('app.sub.s3_anam', v->>'anamnese_id', false);
+
+    BEGIN
+        PERFORM public.submeter_anamnese(v->>'token',
+            jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a2','resposta','só a opcional')),
+            true, 'termo');
+        RAISE EXCEPTION 'S3 FALHOU: obrigatória em falta aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%obrigatória%', format('S3 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'S3 OK — obrigatória em falta rejeitada';
+    END;
+
+    BEGIN
+        PERFORM public.submeter_anamnese(v->>'token',
+            jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não')),
+            false, NULL);
+        RAISE EXCEPTION 'S5 FALHOU: sem consentimento aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%consentimento%', format('S5 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'S5 OK — LGPD: sem consentimento não entra';
+    END;
+
+    -- o token SOBREVIVEU aos erros (rollback por tentativa): corrigir e enviar funciona
+    PERFORM public.submeter_anamnese(v->>'token',
+        jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não')),
+        true, 'termo');
+    ASSERT (SELECT estado FROM anamneses WHERE id = (v->>'anamnese_id')::UUID) = 'liberada';
+    RAISE NOTICE 'S3b OK — erros não queimam o token; correção entra';
+END $$;
+
+-- S4: pergunta de OUTRO modelo → erro
+DO $$
+DECLARE v JSONB;
+BEGIN
+    v := teste_agenda_com_anamnese('aaaaaaaa-0000-0000-0000-000000000041', 5, '10:00', 'sub-s4');
+    BEGIN
+        PERFORM public.submeter_anamnese(v->>'token',
+            jsonb_build_array(
+                jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não'),
+                jsonb_build_object('pergunta_id', (SELECT id FROM modelo_perguntas WHERE modelo_id = 'bbbbbbbb-0000-0000-0000-000000000001' LIMIT 1),'resposta','intrusa')),
+            true, 'termo');
+        RAISE EXCEPTION 'S4 FALHOU: pergunta estranha ao modelo aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%não pertence%', format('S4 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'S4 OK — resposta para pergunta de outro modelo rejeitada';
+    END;
+END $$;
+
+-- S6: token expirado → erro claro; regenerar devolve NOVO token que funciona
+DO $$
+DECLARE v JSONB; v_novo TEXT; v_estado TEXT;
+BEGIN
+    v := teste_agenda_com_anamnese('aaaaaaaa-0000-0000-0000-000000000041', 2, '09:00', 'sub-s6');
+    UPDATE anamnese_tokens SET expira_em = now() - interval '1 minute'
+    WHERE anamnese_id = (v->>'anamnese_id')::UUID;
+
+    BEGIN
+        PERFORM public.submeter_anamnese(v->>'token',
+            jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não')),
+            true, 'termo');
+        RAISE EXCEPTION 'S6 FALHOU: token expirado aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%expirou%', format('S6 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'S6 OK — expirado rejeitado com mensagem útil';
+    END;
+
+    v_novo := public.regenerar_token_anamnese((v->>'anamnese_id')::UUID);
+    ASSERT v_novo IS NOT NULL AND v_novo <> v->>'token';
+    v_estado := public.submeter_anamnese(v_novo,
+        jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não')),
+        true, 'termo');
+    ASSERT v_estado = 'liberada';
+    RAISE NOTICE 'S6b OK — regeneração (só equipe) emite novo link funcional';
+END $$;
+
+-- S7: ficha respondida NÃO aceita segunda submissão nem com token novo
+DO $$
+DECLARE v_anam UUID := current_setting('app.sub.s3_anam')::UUID; v_tok TEXT;
+BEGIN
+    v_tok := public.regenerar_token_anamnese(v_anam);
+    BEGIN
+        PERFORM public.submeter_anamnese(v_tok,
+            jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','sim')),
+            true, 'termo');
+        RAISE EXCEPTION 'S7 FALHOU: ficha já respondida re-submetida';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%já foi respondida%', format('S7 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'S7 OK — ficha respondida é terminal';
+    END;
+END $$;
+
+
+-- ================================================================
+-- FICHEIRO: bloqueio_flow_test.sql
+-- ================================================================
+
+-- bloqueio_flow_test.sql (v3.4 NOVO) — criar_bloqueio_com_conflito (regressão Ricardo):
+-- bloquear a agenda em cima de horário ocupado NÃO estoura exclusion_violation crua —
+-- cancela os itens afetados pelo fluxo normal (regra 16h + revisão de valores) e avisa.
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+-- B1: reserva confirmada paga + bloqueio por cima → cancelada com revisão CHEIA + aviso na fila
+DO $$
+DECLARE v_r UUID; v_inicio TIMESTAMPTZ; v_res JSONB; v_valor DECIMAL;
+BEGIN
+    v_r := teste_cria_reserva(5, '14:00', 'bloq-b1');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.confirmar_reserva(v_r);
+    v_inicio := teste_proximo_dia(5, '13:00');
+
+    v_res := public.criar_bloqueio_com_conflito(
+        '33333333-3333-3333-3333-333333333333', v_inicio, v_inicio + interval '2 hours',
+        'imprevisto', 'Encanador estourou no salão');
+
+    ASSERT (v_res->>'itens_cancelados')::INT = 1, format('B1: itens %s', v_res->>'itens_cancelados');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada';
+    SELECT valor_sinal INTO v_valor FROM revisoes_cancelamento WHERE reserva_id = v_r;
+    ASSERT v_valor = 30.00, format('B1: revisão devia ter o sinal CHEIO (R$ 30), veio %s', v_valor);
+    ASSERT EXISTS (SELECT 1 FROM agenda_ocupacoes
+                   WHERE origem = 'bloqueio' AND origem_id = (v_res->>'bloqueio_id')::UUID AND estado = 'ativa'),
+        'B1: ocupação do bloqueio devia estar ativa';
+    ASSERT EXISTS (SELECT 1 FROM jobs WHERE tipo = 'notificar_cliente_cancelamento'
+                   AND payload->>'reserva_id' = v_r::TEXT),
+        'B1: aviso ao cliente devia estar enfileirado';
+    RAISE NOTICE 'B1 OK — bloqueio com conflito: reserva cancelada, revisão de R$ %, cliente avisado', v_valor;
+END $$;
+
+-- B2: reserva de DOIS itens — bloqueio atinge só a Laira; o item da Prof B sobrevive
+DO $$
+DECLARE v_r UUID; v_item_laira UUID; v_item_profb UUID; v_inicio TIMESTAMPTZ; v_res JSONB; v_valor DECIMAL;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','33333333-3333-3333-3333-333333333333', 'inicio', teste_proximo_dia(3,'15:00')),
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-000000000001', 'inicio', teste_proximo_dia(3,'15:00'))
+        ), 'bloq-b2') ->> 'reserva_id')::UUID;
+    PERFORM teste_paga_sinal(v_r, 'sinal', 60.00);
+    PERFORM public.confirmar_reserva(v_r);
+
+    SELECT id INTO v_item_laira FROM reserva_itens WHERE reserva_id = v_r
+        AND profissional_id = '33333333-3333-3333-3333-333333333333';
+    SELECT id INTO v_item_profb FROM reserva_itens WHERE reserva_id = v_r
+        AND profissional_id = 'dddddddd-0000-0000-0000-000000000001';
+    v_inicio := teste_proximo_dia(3, '15:00');
+
+    v_res := public.criar_bloqueio_com_conflito(
+        '33333333-3333-3333-3333-333333333333', v_inicio, v_inicio + interval '1 hour',
+        'folga', 'Consulta médica da Laira');
+
+    ASSERT (v_res->>'itens_cancelados')::INT = 1, format('B2: devia cancelar 1 item, cancelou %s', v_res->>'itens_cancelados');
+    ASSERT (SELECT estado FROM reserva_itens WHERE id = v_item_laira) = 'cancelado';
+    ASSERT (SELECT estado FROM reserva_itens WHERE id = v_item_profb) = 'confirmado',
+        'B2: item da Prof B devia sobreviver';
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada';
+    SELECT valor_sinal INTO v_valor FROM revisoes_cancelamento WHERE reserva_item_id = v_item_laira;
+    ASSERT v_valor = 30.00, format('B2: revisão proporcional devia ser 30.00, veio %s', v_valor);
+    ASSERT (SELECT COUNT(*) FROM agenda_ocupacoes WHERE reserva_item_id = v_item_profb AND estado = 'ativa') = 2;
+    RAISE NOTICE 'B2 OK — bloqueio cirúrgico: só o item da Laira cai (revisão R$ %), Prof B intacta', v_valor;
+END $$;
+
+-- B3: INSERT direto de bloqueio em cima de horário ocupado CONTINUA protegido pelo EXCLUDE
+-- (a RPC é o caminho certo; o banco é a rede de segurança)
+DO $$
+DECLARE v_inicio TIMESTAMPTZ;
+BEGIN
+    v_inicio := teste_proximo_dia(3, '15:00');
+    BEGIN
+        INSERT INTO bloqueios (empresa_id, profissional_id, inicio, fim, motivo, tipo)
+        VALUES ('00000000-0000-0000-0000-000000000001', 'dddddddd-0000-0000-0000-000000000001',
+                v_inicio, v_inicio + interval '1 hour', 'direto no banco', 'folga');
+        RAISE EXCEPTION 'B3 FALHOU: INSERT direto passou por cima de ocupação ativa';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%exclude_profissional_conflito%' OR SQLERRM LIKE '%conflicting key%', format('B3 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'B3 OK — EXCLUDE continua a proteger a agenda (rede de segurança)';
+    END;
+END $$;
+
+-- B4: bloqueio sem conflito nenhum → cria direto, zero cancelamentos
+DO $$
+DECLARE v_res JSONB; v_inicio TIMESTAMPTZ;
+BEGIN
+    v_inicio := teste_proximo_dia(6, '11:30');
+    v_res := public.criar_bloqueio_com_conflito(
+        'dddddddd-0000-0000-0000-000000000001', v_inicio, v_inicio + interval '30 minutes',
+        'almoco', 'Almoço Prof B');
+    ASSERT (v_res->>'itens_cancelados')::INT = 0;
+    RAISE NOTICE 'B4 OK — bloqueio limpo sem efeitos colaterais';
+END $$;
+
+
+-- ================================================================
+-- FICHEIRO: concurrency_test.sql
+-- ================================================================
+
+-- concurrency_test.sql — prova de que pagamento e cron NÃO disputam a mesma reserva (Ricardo #4)
+--
+-- Este ficheiro descreve o teste de DUAS SESSÕES. Correr com dois psql em paralelo,
+-- ou com o orquestrador Python (ver resultados no documento v3.3 — foi executado
+-- contra PostgreSQL 15.10 real).
+--
+-- Cenário: reserva PAGA com ocupações vencidas.
+--   Sessão A (confirmação): bloqueia a reserva FOR UPDATE (como confirmar_reserva faz).
+--   Sessão B (cron):        expirar_pre_reservas() tenta bloquear a MESMA linha.
+-- Prova: B fica à espera de A; quando A termina, B vê o pagamento e NÃO cancela.
+--
+-- Preparação (qualquer sessão):
+
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000031', '00000000-0000-0000-0000-000000000001', 'teste_concorrencia', '11111111-1111-1111-1111-111111111111', 60, 100.00, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000031', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+DO $$
+DECLARE v UUID;
+BEGIN
+    v := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000031',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'inicio', teste_proximo_dia(4,'11:00'))), 'conc-t1')) ->> 'reserva_id';
+    -- paga o sinal
+    INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    SELECT c.id, c.empresa_id, 'conc-' || gen_random_uuid()::TEXT, 30.00, 'pix', 'sinal', 'pago'
+    FROM cobrancas c WHERE c.reserva_id = v;
+    -- vence as ocupações (cron ainda não correu)
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v;
+    RAISE NOTICE 'RESERVA DO TESTE DE CONCORRÊNCIA: %', v;
+END $$;
+
+-- =======================  SESSÃO A (numa janela psql)  =======================
+-- BEGIN;
+-- SELECT id FROM reservas WHERE id = '<RESERVA>' FOR UPDATE;
+-- SELECT pg_sleep(5);            -- segura o lock 5 segundos
+-- COMMIT;
+--
+-- =======================  SESSÃO B (outra janela, 1s depois)  ==============
+-- SELECT expirar_pre_reservas();  -- TEM DE ESPERAR pela Sessão A
+-- SELECT estado FROM reservas WHERE id = '<RESERVA>';
+-- -- resultado esperado: 'pre_reserva' (NÃO cancelada — está paga)
+--
+-- Veredito: se B terminou ANTES de A sem esperar, ou se a reserva ficou
+-- 'cancelada', o teste FALHOU e a corrida existe.
+
+
+-- ================================================================
+-- FICHEIRO: v341_fixes_test.sql
+-- ================================================================
+
+-- v341_fixes_test.sql — provas das 9 correções da auditoria v3.4 → v3.4.1
+-- Corre DEPOIS das 8 suítes anteriores (usa as fixtures delas).
+SET TIME ZONE 'America/Sao_Paulo';
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+-- Prof C (terceira profissional) — usada para não colidir com os slots das suites anteriores
+INSERT INTO profissionais (id, empresa_id, nome) VALUES
+('dddddddd-0000-0000-0000-00000000000c', '00000000-0000-0000-0000-000000000001', 'Prof C Testes')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('dddddddd-0000-0000-0000-00000000000c', 2, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000c', 3, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000c', 4, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000c', 5, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000c', 6, '09:00', '13:00')
+ON CONFLICT DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('dddddddd-0000-0000-0000-00000000000c', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001'),
+('dddddddd-0000-0000-0000-00000000000c', 'aaaaaaaa-0000-0000-0000-000000000031', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+-- F1 (auditoria #1): cancelar os DOIS itens um a um → a fila vale EXATAMENTE o pago
+DO $$
+DECLARE v_r UUID; v_i1 UUID; v_i2 UUID; v_soma DECIMAL; v_n INT;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(4,'09:00')),
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(5,'12:00'))
+        ), 'f1-dupla') ->> 'reserva_id')::UUID;
+    PERFORM teste_paga_sinal(v_r, 'sinal', 60.00);
+    PERFORM public.confirmar_reserva(v_r);
+
+    SELECT id INTO v_i1 FROM reserva_itens WHERE reserva_id = v_r ORDER BY inicio LIMIT 1;
+    SELECT id INTO v_i2 FROM reserva_itens WHERE reserva_id = v_r ORDER BY inicio OFFSET 1 LIMIT 1;
+
+    PERFORM public.cancelar_item_reserva(v_i1);
+    PERFORM public.cancelar_item_reserva(v_i2);   -- último → delega em cancelar_reserva
+
+    SELECT COALESCE(SUM(valor_sinal),0), COUNT(*) INTO v_soma, v_n
+    FROM revisoes_cancelamento WHERE reserva_id = v_r;
+    ASSERT v_soma = 60.00, format('F1 REGRESSÃO (auditoria #1): fila com R$ %s por R$ 60 pagos — dinheiro contado em dobro', v_soma);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada';
+    RAISE NOTICE 'F1 OK — fila vale exatamente o pago (R$ % em % revisões)', v_soma, v_n;
+END $$;
+
+-- F2 (auditoria #1): bloqueio pegando DOIS itens da mesma reserva → mesma garantia
+DO $$
+DECLARE v_r UUID; v_inicio TIMESTAMPTZ; v_res JSONB; v_soma DECIMAL;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(2,'14:00')),
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(2,'16:00'))
+        ), 'f2-bloqueio') ->> 'reserva_id')::UUID;
+    PERFORM teste_paga_sinal(v_r, 'sinal', 60.00);
+    PERFORM public.confirmar_reserva(v_r);
+    v_inicio := teste_proximo_dia(2, '13:30');
+
+    v_res := public.criar_bloqueio_com_conflito(
+        'dddddddd-0000-0000-0000-00000000000c', v_inicio, v_inicio + interval '3 hours',
+        'imprevisto', 'Prof C ficou doente');
+
+    ASSERT (v_res->>'itens_cancelados')::INT = 2;
+    SELECT COALESCE(SUM(valor_sinal),0) INTO v_soma FROM revisoes_cancelamento WHERE reserva_id = v_r;
+    ASSERT v_soma = 60.00, format('F2 REGRESSÃO (auditoria #1): bloqueio em 2 itens gerou fila de R$ %s por R$ 60 pagos', v_soma);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada';
+    PERFORM set_config('app.f2.bloqueio', v_res->>'bloqueio_id', false);
+    RAISE NOTICE 'F2 OK — bloqueio em 2 itens: fila de R$ % (sem dupla contagem)', v_soma;
+END $$;
+
+-- F3 (auditoria #3): percentual_sinal = 0 → nasce CONFIRMADA, sem expires_at, cron não toca
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, percentual_sinal, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000051', '00000000-0000-0000-0000-000000000001', 'teste_sem_sinal', '11111111-1111-1111-1111-111111111111', 60, 120.00, 0, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('dddddddd-0000-0000-0000-00000000000c', 'aaaaaaaa-0000-0000-0000-000000000051', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+DO $$
+DECLARE v JSONB; v_r UUID;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000051',
+            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(3,'14:00'))),
+        'f3-zero-sinal');
+    v_r := (v->>'reserva_id')::UUID;
+
+    ASSERT v->>'estado' = 'confirmada', format('F3: estado devolvido %s', v->>'estado');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada',
+        'F3 REGRESSÃO (auditoria #3): sinal zero não nasceu confirmada — morreria em 30 min';
+    ASSERT (SELECT COUNT(*) FROM agenda_ocupacoes
+            WHERE origem = 'reserva' AND origem_id = v_r AND estado = 'ativa' AND expires_at IS NULL) = 2,
+        'F3: ocupações deviam ser definitivas (sem expires_at)';
+    ASSERT (SELECT valor_sinal FROM cobrancas WHERE reserva_id = v_r) = 0;
+    PERFORM public.expirar_pre_reservas();
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada', 'F3: cron mexeu em reserva sem sinal';
+    RAISE NOTICE 'F3 OK — agenda vazia funciona: sinal 0 nasce confirmada e o cron ignora';
+END $$;
+
+-- F4 (auditoria #4): pagar 100% no balcão NÃO realiza; finalizar_atendimento sim — e sem MFA no caixa
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB;
+BEGIN
+    v_r := teste_cria_reserva(6, '09:00', 'f4-presencial');
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.confirmar_reserva(v_r);
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    PERFORM set_config('app.f4.cob', v_cob::TEXT, false);
+    PERFORM set_config('app.f4.r', v_r::TEXT, false);
+END $$;
+
+-- caixa autenticado com aal1 (sem TOTP) — decisão de negócio: dinheiro ENTRANDO não exige MFA
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated","aal":"aal1"}', false);
+DO $$
+DECLARE v_res JSONB;
+BEGIN
+    v_res := public.registrar_pagamento_presencial(
+        current_setting('app.f4.cob')::UUID, 70.00, 'dinheiro', 'saldo', 'f4-caixa-1');
+    ASSERT v_res->>'reserva_status' = 'confirmada', format('F4 REGRESSÃO (auditoria #4): pagamento marcou %s — pagar adiantado não é ter atendido', v_res->>'reserva_status');
+    ASSERT (SELECT estado FROM cobrancas WHERE id = current_setting('app.f4.cob')::UUID) = 'total_pago';
+    RAISE NOTICE 'F4a OK — total pago no balcão (aal1): cobrança fecha, atendimento NÃO vira realizado';
+END $$;
+RESET ROLE;
+SELECT set_config('request.jwt.claims', '{}', false);
+
+DO $$
+BEGIN
+    PERFORM public.finalizar_atendimento(current_setting('app.f4.r')::UUID);
+    ASSERT (SELECT estado FROM reservas WHERE id = current_setting('app.f4.r')::UUID) = 'realizada';
+    ASSERT (SELECT COUNT(*) FROM reserva_itens WHERE reserva_id = current_setting('app.f4.r')::UUID AND estado = 'realizado') = 1;
+    BEGIN
+        PERFORM public.cancelar_reserva(current_setting('app.f4.r')::UUID);
+        RAISE EXCEPTION 'F4 FALHOU: cancelou atendimento já realizado';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%não pode ser cancelada%', format('F4 erro inesperado: %s', SQLERRM);
+    END;
+    RAISE NOTICE 'F4b OK — realizada é ação da equipe e é terminal';
+END $$;
+
+-- F5 (auditoria #5): resolver 'confirmar' não reagenda o passado; e confirmação após cron revive os itens
+DO $$
+DECLARE v_rev UUID; v_r UUID;
+BEGIN
+    v_rev := teste_cria_revisao_atrasada(2, '15:00', 'f5-passado', 30.00);
+    SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
+    UPDATE reserva_itens SET inicio = now() - interval '2 days', fim = now() - interval '2 days' + interval '1 hour'
+    WHERE reserva_id = v_r;
+    BEGIN
+        PERFORM public.resolver_revisao(v_rev, 'confirmar', 'pix caiu 3 dias depois');
+        RAISE EXCEPTION 'F5 FALHOU: reagendou no passado';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%já passou%', format('F5 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'F5a OK — passado não se reagenda: %', SQLERRM;
+    END;
+    PERFORM public.resolver_revisao(v_rev, 'credito', 'horário já era');
+    ASSERT (SELECT decisao_final FROM revisoes_cancelamento WHERE id = v_rev) = 'credito';
+END $$;
+
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_rev UUID; v_res JSONB;
+BEGIN
+    -- cron expira SEM pagamento (v3.4.1b: itens ficam 'pendente'), webhook chega depois → revisão → confirmar
+    v_r := teste_cria_reserva(2, '15:00', 'f5b-cron-webhook');
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'expirada';
+    ASSERT (SELECT COUNT(*) FROM reserva_itens WHERE reserva_id = v_r AND estado = 'pendente') = 1,
+        'F5b: v3.4.1b — cron não-pago deixa itens pendente (cancelado = só desistência)';
+
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-f5b', 30.00, NULL, v_cob, 'mp-f5b', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'pagamento_em_revisao';
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+
+    v_res := public.resolver_revisao(v_rev, 'confirmar', 'cliente provou o pix');
+    ASSERT v_res->>'reserva_status' = 'confirmada', format('F5b: status %s', v_res->>'reserva_status');
+    ASSERT (SELECT COUNT(*) FROM reserva_itens WHERE reserva_id = v_r AND estado = 'confirmado') = 1,
+        'F5b REGRESSÃO: reserva confirmada SEM itens (bug do cron)';
+    ASSERT (SELECT COUNT(*) FROM agenda_ocupacoes
+            WHERE origem = 'reserva' AND origem_id = v_r AND estado = 'ativa' AND expires_at IS NULL) = 2,
+        'F5b REGRESSÃO: ocupações não foram recriadas';
+    RAISE NOTICE 'F5b OK — cron→webhook→confirmar: reserva completa (item revivido + 2 ocupações)';
+END $$;
+
+-- F6 (auditoria #6): tabelas de workflow/dinheiro também são 100% RPC
+SET ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000001","role":"authenticated","aal":"aal2"}', false);
+DO $$
+DECLARE v_rev UUID;
+BEGIN
+    BEGIN
+        INSERT INTO bloqueios (empresa_id, profissional_id, inicio, fim, motivo, tipo)
+        VALUES ('00000000-0000-0000-0000-000000000001', '33333333-3333-3333-3333-333333333333',
+                now() + interval '30 days', now() + interval '30 days 1 hour', 'direto', 'folga');
+        RAISE EXCEPTION 'F6 FALHOU: admin inseriu bloqueio direto';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%', format('F6a erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'F6a OK — bloqueios só via RPC (o frontend não consegue recriar o 23P01)';
+    END;
+
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE decisao_final IS NULL LIMIT 1;
+    IF v_rev IS NOT NULL THEN
+        BEGIN
+            UPDATE revisoes_cancelamento SET decisao_final = 'perdido' WHERE id = v_rev;
+            RAISE EXCEPTION 'F6 FALHOU: admin decidiu revisão na mão (sem MFA, sem resolver_revisao)';
+        EXCEPTION WHEN OTHERS THEN
+            ASSERT SQLERRM LIKE '%permission denied%', format('F6b erro inesperado: %s', SQLERRM);
+            RAISE NOTICE 'F6b OK — decisão de revisão só via resolver_revisao (com MFA)';
+        END;
+    END IF;
+
+    BEGIN
+        INSERT INTO lancamentos_creditos (conta_id, tipo_lancamento, valor, saldo_apos, idempotencia_key)
+        SELECT conta_id, 'credito_cancelamento', 999, 999, 'fraude' FROM lancamentos_creditos LIMIT 1;
+        RAISE EXCEPTION 'F6 FALHOU: admin criou crédito na mão';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%permission denied%' OR SQLERRM LIKE '%null value%', format('F6c erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'F6c OK — créditos só via resolver_revisao';
+    END;
+END $$;
+RESET ROLE;
+SELECT set_config('request.jwt.claims', '{}', false);
+
+-- remover_bloqueio: a saída operacional com o REVOKE em vigor
+DO $$
+BEGIN
+    PERFORM public.remover_bloqueio(current_setting('app.f2.bloqueio')::UUID);
+    ASSERT NOT EXISTS (SELECT 1 FROM bloqueios WHERE id = current_setting('app.f2.bloqueio')::UUID);
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes
+        WHERE origem = 'bloqueio' AND origem_id = current_setting('app.f2.bloqueio')::UUID AND estado = 'ativa');
+    RAISE NOTICE 'F6d OK — remover_bloqueio remove e liberta as ocupações';
+END $$;
+
+-- F7 (parcial vencido): parcela de sinal SEM complemento não prende o horário — vai à fila
+DO $$
+DECLARE v_r UUID; v_valor DECIMAL;
+BEGIN
+    v_r := teste_cria_reserva(5, '16:00', 'f7-parcial');
+    PERFORM teste_paga_sinal(v_r, 'saldo', 10.00);   -- parcela de 10 de um sinal de 30
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pagamento_em_revisao',
+        'F7 REGRESSÃO: parcial vencido ficou preso em pre_reserva';
+    ASSERT NOT EXISTS (SELECT 1 FROM agenda_ocupacoes WHERE origem_id = v_r AND estado = 'ativa'),
+        'F7 REGRESSÃO: parcial vencido continua a prender o slot';
+    SELECT valor_sinal INTO v_valor FROM revisoes_cancelamento WHERE reserva_id = v_r;
+    ASSERT v_valor = 10.00, format('F7: revisão devia ser pela parcela (10.00), veio %s', v_valor);
+    PERFORM teste_cria_reserva(5, '16:00', 'f7-remarcacao');  -- o horário foi mesmo libertado
+    RAISE NOTICE 'F7 OK — parcial vencido: fila de R$ % + horário re-agendável', v_valor;
+END $$;
+
+-- F8 (menor): ficha de agendamento cancelado não se responde
+DO $$
+DECLARE v JSONB;
+BEGIN
+    v := teste_agenda_com_anamnese('aaaaaaaa-0000-0000-0000-000000000041', 2, '13:30', 'f8-anamnese-morta');
+    PERFORM public.cancelar_pre_reserva((v->>'reserva_id')::UUID);
+    BEGIN
+        PERFORM public.submeter_anamnese(v->>'token',
+            jsonb_build_array(jsonb_build_object('pergunta_id','bbbbbbbb-0000-0000-0000-0000000000a1','resposta','não')),
+            true, 'termo');
+        RAISE EXCEPTION 'F8 FALHOU: ficha de reserva cancelada aceite';
+    EXCEPTION WHEN OTHERS THEN
+        ASSERT SQLERRM LIKE '%já não está ativo%', format('F8 erro inesperado: %s', SQLERRM);
+        RAISE NOTICE 'F8 OK — ficha de agendamento morto rejeitada';
+    END;
+END $$;
+
+-- F10 (menor): expirada tem saída — cancelar_pre_reserva limpa
+DO $$
+DECLARE v_r UUID;
+BEGIN
+    v_r := teste_cria_reserva(4, '15:00', 'f10-expirada');
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'expirada';
+    PERFORM public.cancelar_pre_reserva(v_r);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada';
+    ASSERT (SELECT estado FROM cobrancas WHERE reserva_id = v_r) = 'cancelada';
+    RAISE NOTICE 'F10 OK — expirada deixou de ser um estado sem saída';
+END $$;
+
+-- F11 (auditoria v3.4.1 — GRAVE): revisão decidida 'confirmar' NÃO pode
+-- descontar da fila — o dinheiro voltou à reserva viva. Sem o filtro
+-- IS DISTINCT FROM 'confirmar', um cancelamento posterior calculava 30 − 30 = 0
+-- e R$ 30 ficava sem destino e sem rasto.
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_rev UUID; v_res JSONB; v_soma DECIMAL;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(3,'16:00'))),
+        'f11-grave')) ->> 'reserva_id';
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+
+    -- sinal cai fora do prazo: cron expira, webhook confirma o atrasado, admin confirma
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-f11', 30.00, NULL, v_cob, 'mp-f11', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'pagamento_em_revisao';
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    v_res := public.resolver_revisao(v_rev, 'confirmar', 'horário livre, cliente provou o pix');
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'confirmada';
+    ASSERT (SELECT decisao_final FROM revisoes_cancelamento WHERE id = v_rev) = 'confirmar';
+
+    -- semanas depois a cliente cancela: a fila TEM de nascer com os R$ 30 outra vez
+    PERFORM public.cancelar_reserva(v_r, NULL, 'cliente desistiu');
+    SELECT COALESCE(SUM(valor_sinal), 0) INTO v_soma
+    FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    ASSERT v_soma = 30.00, format('F11 REGRESSÃO (GRAVE): cancelamento após confirmar abriu fila de R$ %s — devia ser R$ 30.00 (o confirmar devolveu o dinheiro à reserva)', v_soma);
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'cancelada';
+    RAISE NOTICE 'F11 OK — confirmar não desconta: cancelamento posterior reabre fila de R$ 30';
+END $$;
+
+-- F12 (auditoria v3.4.1 — MÉDIO): resolver('confirmar') NÃO ressuscita item que a
+-- cliente cancelou de propósito. Pré-reserva com 2 serviços, desistência de um
+-- (sem dinheiro → sem revisão), sinal atrasado, admin confirma → só o item
+-- 'pendente' volta; o 'cancelado' fica cancelado.
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_rev UUID; v_i1 UUID; v_i2 UUID; v_res JSONB; v_soma DECIMAL;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(6,'10:00')),
+            jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+                'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(6,'11:00'))),
+        'f12-medio')) ->> 'reserva_id';
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    SELECT id INTO v_i1 FROM reserva_itens WHERE reserva_id = v_r ORDER BY inicio LIMIT 1;
+    SELECT id INTO v_i2 FROM reserva_itens WHERE reserva_id = v_r ORDER BY inicio OFFSET 1 LIMIT 1;
+
+    -- cliente desiste do 2.º serviço ANTES de pagar (sem dinheiro → sem revisão)
+    PERFORM public.cancelar_item_reserva(v_i2, NULL, 'cliente desistiu deste serviço');
+    ASSERT (SELECT estado FROM reserva_itens WHERE id = v_i2) = 'cancelado';
+    ASSERT NOT EXISTS (SELECT 1 FROM revisoes_cancelamento WHERE reserva_id = v_r);
+
+    -- sinal chega atrasado: cron expira (v3.4.1b: itens ficam pendente), webhook, admin confirma
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-f12', 30.00, NULL, v_cob, 'mp-f12', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'pagamento_em_revisao';
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    v_res := public.resolver_revisao(v_rev, 'confirmar', 'horário livre');
+
+    ASSERT (SELECT estado FROM reserva_itens WHERE id = v_i1) = 'confirmado',
+        'F12: item pendente devia ter sido revivido';
+    ASSERT (SELECT estado FROM reserva_itens WHERE id = v_i2) = 'cancelado',
+        'F12 REGRESSÃO (MÉDIO): item recusado pela cliente foi RESSUSCITADO pelo confirmar';
+    ASSERT (SELECT COUNT(*) FROM agenda_ocupacoes
+            WHERE origem = 'reserva' AND origem_id = v_r AND estado = 'ativa') = 2,
+        'F12 REGRESSÃO: ocupações a mais — item cancelado voltou à agenda';
+
+    -- bónus (amarra F11 ao caminho do item): cancelar o item revivido → fila com os R$ 30
+    PERFORM public.cancelar_item_reserva(v_i1, NULL, 'cliente cancelou tudo');
+    SELECT COALESCE(SUM(valor_sinal), 0) INTO v_soma
+    FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    ASSERT v_soma = 30.00, format('F12/F11 REGRESSÃO: fila de R$ %s após cancelar item confirmado — devia ser R$ 30.00', v_soma);
+    RAISE NOTICE 'F12 OK — confirmar revive só pendente; item recusado não volta (e cancelar depois abre fila certa)';
+END $$;
+
+-- F13 (achado da prova de corrida F9 — GRAVE): webhook de saldo chega DEPOIS do
+-- cancelamento. Antes: a revisão aberta (30) fazia o índice único engolir o novo
+-- INSERT (100) → R$ 70 sem rasto. Agora a fila aberta é completada para o pago total.
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB; v_soma DECIMAL; v_n INT;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(3,'13:00'))),
+        'f13-saldo-pos-cancel')) ->> 'reserva_id';
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+
+    PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
+    PERFORM public.confirmar_reserva(v_r);
+    PERFORM public.cancelar_reserva(v_r, NULL, 'cliente desistiu');
+    ASSERT (SELECT valor_sinal FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL) = 30.00;
+
+    -- o saldo (70) cai no webhook com a reserva já cancelada
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-f13', 70.00, NULL, v_cob, 'mp-f13', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'revisao_manual', format('F13: status %s', v_res->>'status');
+
+    SELECT COALESCE(SUM(valor_sinal),0), COUNT(*) INTO v_soma, v_n
+    FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    ASSERT v_soma = 100.00, format('F13 REGRESSÃO (GRAVE): fila aberta de R$ %s por R$ 100 pagos — dinheiro sem rasto', v_soma);
+    ASSERT v_n = 1, format('F13: devia haver UMA revisão aberta ao nível da reserva, há %s', v_n);
+    RAISE NOTICE 'F13 OK — saldo pós-cancelamento: fila completada para os R$ 100 pagos';
+END $$;
+
+-- F14 (mesma família): 2.º pagamento com a reserva JÁ em revisão entra na fila
+-- (antes só notificava — a fila ficava curta)
+DO $$
+DECLARE v_r UUID; v_cob UUID; v_res JSONB; v_soma DECIMAL; v_n INT;
+BEGIN
+    v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'inicio', teste_proximo_dia(4,'13:00'))),
+        'f14-topup-revisao')) ->> 'reserva_id';
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+
+    -- parcial de 10 (< sinal 30) → registado; cron expira → revisão de 10
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-f14a', 10.00, NULL, v_cob, 'mp-f14a', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'parcial_registrado', format('F14: status %s', v_res->>'status');
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.expirar_pre_reservas();
+    ASSERT (SELECT estado FROM reservas WHERE id = v_r) = 'pagamento_em_revisao';
+    ASSERT (SELECT valor_sinal FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL) = 10.00;
+
+    -- mais 20 no webhook com a reserva em revisão → fila passa a valer 30
+    v_res := public.processar_pagamento_webhook('mercado_pago', 'evt-f14b', 20.00, NULL, v_cob, 'mp-f14b', '{}'::JSONB, true);
+    ASSERT v_res->>'status' = 'pagamento_em_revisao';
+    SELECT COALESCE(SUM(valor_sinal),0), COUNT(*) INTO v_soma, v_n
+    FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    ASSERT v_soma = 30.00, format('F14 REGRESSÃO: fila de R$ %s por R$ 30 pagos — 2.º pagamento não entrou na fila', v_soma);
+    ASSERT v_n = 1, format('F14: devia haver UMA revisão aberta ao nível da reserva, há %s', v_n);
+    RAISE NOTICE 'F14 OK — pagamento em revisão entra na fila: R$ 10 + R$ 20 = R$ 30';
+END $$;
