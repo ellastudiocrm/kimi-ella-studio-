@@ -390,6 +390,16 @@ BEGIN
     WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
       AND motivo LIKE 'Teste%';
 
+    -- v3.4.4: limpa créditos criados pelo teste A2a (resolver_revisao ramo 'credito')
+    DELETE FROM public.lancamentos_creditos WHERE conta_id IN (
+        SELECT id FROM public.contas_creditos
+        WHERE cliente_id = 'cccccccc-0000-0000-0000-000000000011'
+          AND empresa_id = '00000000-0000-0000-0000-000000000001'
+    );
+    DELETE FROM public.contas_creditos
+    WHERE cliente_id = 'cccccccc-0000-0000-0000-000000000011'
+      AND empresa_id = '00000000-0000-0000-0000-000000000001';
+
     DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
     DROP FUNCTION IF EXISTS public.teste_agenda_com_anamnese(TEXT, INT, TEXT, TEXT);
     DROP FUNCTION IF EXISTS public.teste_paga_sinal(UUID, TEXT, NUMERIC);
