@@ -24,6 +24,9 @@ ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
 INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
 ('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000031', '00000000-0000-0000-0000-000000000001')
 ON CONFLICT DO NOTHING;
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'Cliente Pagamento', '5519999990011')
+ON CONFLICT (id) DO NOTHING;
 
 DO $$
 DECLARE v UUID;
@@ -57,3 +60,52 @@ END $$;
 --
 -- Veredito: se B terminou ANTES de A sem esperar, ou se a reserva ficou
 -- 'cancelada', o teste FALHOU e a corrida existe.
+
+-- Limpeza dos dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key LIKE 'conc-%';
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
+END $$;

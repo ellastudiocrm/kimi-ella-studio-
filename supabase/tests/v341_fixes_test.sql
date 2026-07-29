@@ -7,6 +7,22 @@ LANGUAGE sql STABLE AS $$
     SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
 $$;
 
+-- Fixtures defensivas
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'Cliente Pagamento', '5519999990011')
+ON CONFLICT (id) DO NOTHING;
+
+-- Fixture defensiva: admin autenticado usado em F4 e F5
+INSERT INTO auth.users (id) VALUES ('ffffffff-0000-0000-0000-000000000001') ON CONFLICT (id) DO NOTHING;
+INSERT INTO usuarios_internos (id, auth_user_id, empresa_id, email, nome, perfil) VALUES
+('99999999-0000-0000-0000-000000000001', 'ffffffff-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'admin@ella.test', 'Admin ELLA', 'admin')
+ON CONFLICT (auth_user_id) DO NOTHING;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'teste_pagamento', '11111111-1111-1111-1111-111111111111', 60, 100.00, false),
+('aaaaaaaa-0000-0000-0000-000000000031', '00000000-0000-0000-0000-000000000001', 'teste_concorrencia', '11111111-1111-1111-1111-111111111111', 60, 100.00, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+
 -- Prof C (terceira profissional) — usada para não colidir com os slots das suites anteriores
 INSERT INTO profissionais (id, empresa_id, nome) VALUES
 ('dddddddd-0000-0000-0000-00000000000c', '00000000-0000-0000-0000-000000000001', 'Prof C Testes')
@@ -19,9 +35,77 @@ INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fecham
 ('dddddddd-0000-0000-0000-00000000000c', 6, '09:00', '13:00')
 ON CONFLICT DO NOTHING;
 INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001'),
 ('dddddddd-0000-0000-0000-00000000000c', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001'),
 ('dddddddd-0000-0000-0000-00000000000c', 'aaaaaaaa-0000-0000-0000-000000000031', '00000000-0000-0000-0000-000000000001')
 ON CONFLICT DO NOTHING;
+
+-- Fixture defensiva: modelo de anamnese e serviço com anamnese (usado em F8)
+INSERT INTO modelos_anamnese (id, empresa_id, nome, versao) VALUES
+('bbbbbbbb-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Modelo Regras', 1)
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO modelo_perguntas (id, modelo_id, ordem, pergunta, tipo_resposta, obrigatoria, operador, valor_disparador, resultado_estado) VALUES
+('bbbbbbbb-0000-0000-0000-0000000000a1', 'bbbbbbbb-0000-0000-0000-000000000002', 1, 'Tem alergia a esmalte?', 'sim_nao', true, 'igual', 'sim', 'requer_avaliacao')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria, modelo_anamnese_id) VALUES
+('aaaaaaaa-0000-0000-0000-000000000041', '00000000-0000-0000-0000-000000000001', 'teste_regras_anamnese', '11111111-1111-1111-1111-111111111111', 60, 80.00, true, 'bbbbbbbb-0000-0000-0000-000000000002')
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('dddddddd-0000-0000-0000-00000000000c', 'aaaaaaaa-0000-0000-0000-000000000041', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+-- Helper: paga o sinal de uma reserva
+CREATE OR REPLACE FUNCTION teste_paga_sinal(p_reserva UUID, p_finalidade TEXT, p_valor NUMERIC) RETURNS VOID
+LANGUAGE sql VOLATILE AS $$
+    INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    SELECT c.id, c.empresa_id, 'teste-' || gen_random_uuid()::TEXT, p_valor, 'pix', p_finalidade, 'pago'
+    FROM cobrancas c WHERE c.reserva_id = p_reserva
+$$;
+
+-- Helper: cria pré-reserva e devolve id
+CREATE OR REPLACE FUNCTION teste_cria_reserva(dow INT, hora TEXT, chave TEXT) RETURNS UUID
+LANGUAGE sql VOLATILE AS $$
+    SELECT (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','dddddddd-0000-0000-0000-00000000000c',
+            'cardapio','ella_studio',
+            'inicio', teste_proximo_dia(dow, hora))), chave) ->> 'reserva_id')::UUID
+$$;
+
+-- Helper: cria reserva paga ATRASADA (em pagamento_em_revisao) e devolve a revisão
+CREATE OR REPLACE FUNCTION teste_cria_revisao_atrasada(dow INT, hora TEXT, chave TEXT, valor NUMERIC)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v_r UUID; v_cob UUID; v_rev UUID;
+BEGIN
+    v_r := teste_cria_reserva(dow, hora, chave);
+    SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
+    UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
+    WHERE origem = 'pre_reserva' AND origem_id = v_r;
+    PERFORM public.processar_pagamento_webhook('mercado_pago', 'evt-' || chave, valor,
+        NULL, v_cob, 'mp-' || chave, '{}'::JSONB, true);
+    SELECT id INTO v_rev FROM revisoes_cancelamento WHERE reserva_id = v_r AND decisao_final IS NULL;
+    RETURN v_rev;
+END $$;
+
+-- Helper: agenda com anamnese e devolve {reserva_id, token, anamnese_id}
+CREATE OR REPLACE FUNCTION teste_agenda_com_anamnese(p_servico TEXT, dow INT, hora TEXT, chave TEXT)
+RETURNS JSONB
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v JSONB;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id', p_servico,
+            'profissional_id', 'dddddddd-0000-0000-0000-00000000000c',
+            'cardapio', 'ella_studio',
+            'inicio', teste_proximo_dia(dow, hora))), chave);
+    RETURN jsonb_build_object(
+        'reserva_id', v->>'reserva_id',
+        'anamnese_id', v->'anamneses'->0->>'anamnese_id',
+        'token', v->'anamneses'->0->>'token');
+END $$;
 
 -- F1 (auditoria #1): cancelar os DOIS itens um a um → a fila vale EXATAMENTE o pago
 DO $$
@@ -154,7 +238,7 @@ END $$;
 DO $$
 DECLARE v_rev UUID; v_r UUID;
 BEGIN
-    v_rev := teste_cria_revisao_atrasada(2, '15:00', 'f5-passado', 30.00);
+    v_rev := teste_cria_revisao_atrasada(3, '15:00', 'f5-passado', 30.00);
     SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
     UPDATE reserva_itens SET inicio = now() - interval '2 days', fim = now() - interval '2 days' + interval '1 hour'
     WHERE reserva_id = v_r;
@@ -173,7 +257,7 @@ DO $$
 DECLARE v_r UUID; v_cob UUID; v_rev UUID; v_res JSONB;
 BEGIN
     -- cron expira SEM pagamento (v3.4.1b: itens ficam 'pendente'), webhook chega depois → revisão → confirmar
-    v_r := teste_cria_reserva(2, '15:00', 'f5b-cron-webhook');
+    v_r := teste_cria_reserva(3, '15:00', 'f5b-cron-webhook');
     SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
     UPDATE agenda_ocupacoes SET expires_at = now() - interval '1 minute'
     WHERE origem = 'pre_reserva' AND origem_id = v_r;
@@ -438,4 +522,71 @@ BEGIN
     ASSERT v_soma = 30.00, format('F14 REGRESSÃO: fila de R$ %s por R$ 30 pagos — 2.º pagamento não entrou na fila', v_soma);
     ASSERT v_n = 1, format('F14: devia haver UMA revisão aberta ao nível da reserva, há %s', v_n);
     RAISE NOTICE 'F14 OK — pagamento em revisão entra na fila: R$ 10 + R$ 20 = R$ 30';
+END $$;
+
+-- Limpeza dos dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key LIKE 'f%';
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.webhook_inbox WHERE external_event_id LIKE 'evt-f%';
+
+    DELETE FROM public.bloqueios
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo = 'Prof C ficou doente';
+
+    DELETE FROM public.agenda_ocupacoes
+    WHERE origem = 'bloqueio'
+      AND origem_id IN (
+          SELECT id FROM public.bloqueios
+          WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+            AND motivo = 'Prof C ficou doente'
+      );
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_paga_sinal(UUID, TEXT, NUMERIC);
+    DROP FUNCTION IF EXISTS public.teste_cria_reserva(INT, TEXT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_cria_revisao_atrasada(INT, TEXT, NUMERIC);
+    DROP FUNCTION IF EXISTS public.teste_agenda_com_anamnese(TEXT, INT, TEXT, TEXT);
 END $$;

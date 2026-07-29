@@ -5,25 +5,30 @@ SET TIME ZONE 'America/Sao_Paulo';
 -- Fixtures
 INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
 ('aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'teste_manicure', '11111111-1111-1111-1111-111111111111', 60, 50.00, false),
-('aaaaaaaa-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'teste_sem_modelo', '11111111-1111-1111-1111-111111111111', 60, 50.00, true);
+('aaaaaaaa-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'teste_sem_modelo', '11111111-1111-1111-1111-111111111111', 60, 50.00, true)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
 
 INSERT INTO profissionais (id, empresa_id, nome) VALUES
-('dddddddd-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Prof B Teste');
+('dddddddd-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Prof B Teste')
+ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
 ('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001'),
 ('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001'),
-('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001');
+('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
 
 INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
 ('dddddddd-0000-0000-0000-000000000001', 2, '09:00', '17:00'),
 ('dddddddd-0000-0000-0000-000000000001', 3, '09:00', '17:00'),
 ('dddddddd-0000-0000-0000-000000000001', 4, '09:00', '17:00'),
 ('dddddddd-0000-0000-0000-000000000001', 5, '09:00', '17:00'),
-('dddddddd-0000-0000-0000-000000000001', 6, '09:00', '13:00'); -- v3.4.2: sábado p/ testar última entrada de 13h
+('dddddddd-0000-0000-0000-000000000001', 6, '09:00', '13:00') -- v3.4.2: sábado p/ testar última entrada de 13h
+ON CONFLICT DO NOTHING;
 
 INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
-('cccccccc-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Cliente Teste', '5519999990001');
+('cccccccc-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Cliente Teste', '5519999990001')
+ON CONFLICT (id) DO NOTHING;
 
 -- Helper: próxima data com dado dia da semana (2=terça ... 5=sexta), sempre no futuro
 CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
@@ -342,8 +347,63 @@ BEGIN
     END;
 END $$;
 
--- Limpeza: o ajuste de teste não pode vazar para os outros ficheiros da suíte
-DELETE FROM excecoes_calendario
-WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
-  AND profissional_id = '33333333-3333-3333-3333-333333333333'
-  AND tipo = 'ajuste' AND motivo = 'Teste v3.4.2 — saída às 15h';
+-- Limpeza: dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key LIKE 'sched-%';
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DELETE FROM public.bloqueios
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo = 'Teste imprevisto';
+
+    DELETE FROM public.agenda_ocupacoes
+    WHERE origem = 'bloqueio'
+      AND origem_id IN (
+          SELECT id FROM public.bloqueios
+          WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+            AND motivo = 'Teste imprevisto'
+      );
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
+END $$;

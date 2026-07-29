@@ -1,12 +1,82 @@
 -- auditoria2_test.sql — testes da 2ª auditoria (v3.4.3)
--- Corre DEPOIS das outras suítes. Cobre os 7 itens da 014_auditoria2_fixes.sql.
 SET TIME ZONE 'America/Sao_Paulo';
+RESET ROLE;
+SELECT set_config('request.jwt.claims', '{}', false);
+
+CREATE OR REPLACE FUNCTION teste_proximo_dia(dow INT, hora TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE sql STABLE AS $$
+    SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
+$$;
+
+-- Helper: paga o sinal de uma reserva
+CREATE OR REPLACE FUNCTION teste_paga_sinal(p_reserva UUID, p_finalidade TEXT, p_valor NUMERIC) RETURNS VOID
+LANGUAGE sql VOLATILE AS $$
+    INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    SELECT c.id, c.empresa_id, 'teste-' || gen_random_uuid()::TEXT, p_valor, 'pix', p_finalidade, 'pago'
+    FROM cobrancas c WHERE c.reserva_id = p_reserva
+$$;
+
+-- Fixtures defensivas (idempotentes)
+INSERT INTO profissionais (id, empresa_id, nome) VALUES
+('dddddddd-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Prof B Teste'),
+('dddddddd-0000-0000-0000-00000000000d', '00000000-0000-0000-0000-000000000001', 'Prof D Teste')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('dddddddd-0000-0000-0000-000000000001', 2, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 3, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 4, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 5, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-000000000001', 6, '09:00', '13:00'),
+('dddddddd-0000-0000-0000-00000000000d', 2, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000d', 3, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000d', 4, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000d', 5, '09:00', '17:00'),
+('dddddddd-0000-0000-0000-00000000000d', 6, '09:00', '13:00')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'teste_pagamento', '11111111-1111-1111-1111-111111111111', 60, 100.00, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('dddddddd-0000-0000-0000-00000000000d', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Cliente Teste', '5519999990001'),
+('cccccccc-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'Cliente Pagamento', '5519999990011')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('33333333-3333-3333-3333-333333333333', 2, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 3, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 4, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 5, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 6, '09:00', '13:00')
+ON CONFLICT DO NOTHING;
+
+-- Helper: agenda com anamnese e devolve {reserva_id, token, anamnese_id}
+CREATE OR REPLACE FUNCTION teste_agenda_com_anamnese(p_servico TEXT, dow INT, hora TEXT, chave TEXT)
+RETURNS JSONB
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE v JSONB;
+BEGIN
+    v := public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000001',
+        jsonb_build_array(jsonb_build_object('servico_id', p_servico,
+            'profissional_id', 'dddddddd-0000-0000-0000-000000000001',
+            'cardapio', 'ella_studio',
+            'inicio', teste_proximo_dia(dow, hora))), chave);
+    RETURN jsonb_build_object(
+        'reserva_id', v->>'reserva_id',
+        'anamnese_id', v->'anamneses'->0->>'anamnese_id',
+        'token', v->'anamneses'->0->>'token');
+END $$;
 
 -- =====================================================================
--- ITEM 7: Cardápio oficial ('ella_studio' / 'ella_men')
+-- ITEM 7: Cardápio oficial
 -- =====================================================================
-
--- A7a: valor antigo 'feminino' é rejeitado no INSERT
 DO $$
 BEGIN
     BEGIN
@@ -18,7 +88,6 @@ BEGIN
     END;
 END $$;
 
--- A7b: valor antigo 'masculino' é rejeitado no INSERT
 DO $$
 BEGIN
     BEGIN
@@ -30,7 +99,6 @@ BEGIN
     END;
 END $$;
 
--- A7c: valor novo 'ella_studio' é aceite
 DO $$
 BEGIN
     INSERT INTO servico_cardapios (servico_id, cardapio, nome_comercial)
@@ -41,22 +109,19 @@ BEGIN
 END $$;
 
 -- =====================================================================
--- ITEM 1: Verificação de perfil nas 3 RPCs (GRAVE #2)
+-- ITEM 1: Verificação de perfil nas 3 RPCs
 -- =====================================================================
-
--- Fixture: reserva com Prof C (não é a Laira) como sistema
 DO $$
 DECLARE v_r UUID;
 BEGIN
     v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
         'cccccccc-0000-0000-0000-000000000011',
         jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
-            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'cardapio','ella_studio', 'inicio', now() + interval '2 days')),
+            'profissional_id','dddddddd-0000-0000-0000-00000000000d', 'cardapio','ella_studio', 'inicio', teste_proximo_dia(2,'14:00'))),
         'a1-fixture')) ->> 'reserva_id';
     PERFORM set_config('app.a1.r', v_r::TEXT, false);
 END $$;
 
--- A1a: recepcao de OUTRA empresa tenta cancelar → rejeitado (guarda de inquilino)
 SET ROLE authenticated;
 SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000002","role":"authenticated","aal":"aal1"}', false);
 DO $$
@@ -74,7 +139,6 @@ END $$;
 RESET ROLE;
 SELECT set_config('request.jwt.claims', '{}', false);
 
--- A1b: Laira (profissional) tenta cancelar reserva da Prof C → rejeitado (guarda de perfil)
 SET ROLE authenticated;
 SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000003","role":"authenticated","aal":"aal1"}', false);
 DO $$
@@ -92,7 +156,6 @@ END $$;
 RESET ROLE;
 SELECT set_config('request.jwt.claims', '{}', false);
 
--- A1c: Laira tenta confirmar reserva da Prof C → rejeitado
 SET ROLE authenticated;
 SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000003","role":"authenticated","aal":"aal1"}', false);
 DO $$
@@ -110,7 +173,6 @@ END $$;
 RESET ROLE;
 SELECT set_config('request.jwt.claims', '{}', false);
 
--- A1d: Laira tenta cancelar_pre_reserva da Prof C → rejeitado
 SET ROLE authenticated;
 SELECT set_config('request.jwt.claims', '{"sub":"ffffffff-0000-0000-0000-000000000003","role":"authenticated","aal":"aal1"}', false);
 DO $$
@@ -129,17 +191,15 @@ RESET ROLE;
 SELECT set_config('request.jwt.claims', '{}', false);
 
 -- =====================================================================
--- ITEM 2: Cobrança 'cancelada' nos 3 ramos de resolver_revisao (MÉDIO #3)
+-- ITEM 2: Cobrança 'cancelada' nos 3 ramos de resolver_revisao
 -- =====================================================================
-
--- A2a: ramo 'credito' → cobrança cancelada
 DO $$
 DECLARE v_rev UUID; v_r UUID; v_res JSONB;
 BEGIN
     v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
         'cccccccc-0000-0000-0000-000000000011',
         jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
-            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'cardapio','ella_studio', 'inicio', now() + interval '3 days')),
+            'profissional_id','dddddddd-0000-0000-0000-00000000000d', 'cardapio','ella_studio', 'inicio', teste_proximo_dia(3,'14:00'))),
         'a2-credito')) ->> 'reserva_id';
     PERFORM teste_paga_sinal(v_r::UUID, 'sinal', 30.00);
     PERFORM public.confirmar_reserva(v_r::UUID);
@@ -152,14 +212,13 @@ BEGIN
     RAISE NOTICE 'A2a OK — credito: cobrança cancelada';
 END $$;
 
--- A2b: ramo 'estorno' → cobrança cancelada
 DO $$
 DECLARE v_rev UUID; v_r UUID; v_res JSONB;
 BEGIN
     v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
         'cccccccc-0000-0000-0000-000000000011',
         jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
-            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'cardapio','ella_studio', 'inicio', now() + interval '4 days')),
+            'profissional_id','dddddddd-0000-0000-0000-00000000000d', 'cardapio','ella_studio', 'inicio', teste_proximo_dia(4,'14:00'))),
         'a2-estorno')) ->> 'reserva_id';
     PERFORM teste_paga_sinal(v_r::UUID, 'sinal', 30.00);
     PERFORM public.confirmar_reserva(v_r::UUID);
@@ -172,14 +231,13 @@ BEGIN
     RAISE NOTICE 'A2b OK — estorno: cobrança cancelada';
 END $$;
 
--- A2c: ramo 'perdido' → cobrança cancelada (não 'sinal_pago')
 DO $$
 DECLARE v_rev UUID; v_r UUID; v_res JSONB;
 BEGIN
     v_r := (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
         'cccccccc-0000-0000-0000-000000000011',
         jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
-            'profissional_id','dddddddd-0000-0000-0000-00000000000c', 'cardapio','ella_studio', 'inicio', now() + interval '5 days')),
+            'profissional_id','dddddddd-0000-0000-0000-00000000000d', 'cardapio','ella_studio', 'inicio', teste_proximo_dia(5,'14:00'))),
         'a2-perdido')) ->> 'reserva_id';
     PERFORM teste_paga_sinal(v_r::UUID, 'sinal', 30.00);
     PERFORM public.confirmar_reserva(v_r::UUID);
@@ -193,9 +251,8 @@ BEGIN
 END $$;
 
 -- =====================================================================
--- ITEM 3: CHECK em log_acoes_sensiveis.acao (MENOR #4)
+-- ITEM 3: CHECK em log_acoes_sensiveis.acao
 -- =====================================================================
-
 DO $$
 BEGIN
     BEGIN
@@ -208,10 +265,8 @@ BEGIN
 END $$;
 
 -- =====================================================================
--- ITEM 4: Validação em submeter_anamnese (MENOR #5)
+-- ITEM 4: Validação em submeter_anamnese
 -- =====================================================================
-
--- Criar modelo de teste com pergunta numero e multipla_escolha
 DO $$
 DECLARE v_modelo UUID; v_perg_num UUID; v_perg_mul UUID; v_token TEXT; v_anamnese_id UUID;
 BEGIN
@@ -227,18 +282,18 @@ BEGIN
     VALUES ('dddddddd-0000-0000-0000-0000000000a2', 'cccccccc-0000-0000-0000-0000000000a4', 2, 'Cor preferida?', 'multipla_escolha', '["azul","vermelho","verde"]'::JSONB, true)
     ON CONFLICT (id) DO NOTHING;
 
-    -- Criar serviço com este modelo
     INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, percentual_sinal, anamnese_obrigatoria, modelo_anamnese_id)
     VALUES ('aaaaaaaa-0000-0000-0000-0000000000a4', '00000000-0000-0000-0000-000000000001', 'teste_validacao_anamnese', '11111111-1111-1111-1111-111111111111', 30, 50.00, 30, true, 'cccccccc-0000-0000-0000-0000000000a4')
     ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
     INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
-    ('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-0000000000a4', '00000000-0000-0000-0000-000000000001')
+    ('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-0000000000a4', '00000000-0000-0000-0000-000000000001'),
+    ('dddddddd-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-0000000000a4', '00000000-0000-0000-0000-000000000001'),
+    ('dddddddd-0000-0000-0000-00000000000d', 'aaaaaaaa-0000-0000-0000-0000000000a4', '00000000-0000-0000-0000-000000000001')
     ON CONFLICT DO NOTHING;
 
     RAISE NOTICE 'A4 FIXTURES OK — modelo de teste criado';
 END $$;
 
--- A4a: numero inválido (texto) → rejeitado
 DO $$
 DECLARE v JSONB; v_token TEXT;
 BEGIN
@@ -257,7 +312,6 @@ BEGIN
     END;
 END $$;
 
--- A4b: multipla_escolha fora das opções → rejeitado
 DO $$
 DECLARE v JSONB; v_token TEXT;
 BEGIN
@@ -276,7 +330,6 @@ BEGIN
     END;
 END $$;
 
--- A4c: respostas válidas → aceite
 DO $$
 DECLARE v JSONB; v_token TEXT; v_estado TEXT;
 BEGIN
@@ -289,4 +342,55 @@ BEGIN
         ), true, 'termo');
     ASSERT v_estado = 'liberada', format('A4c: estado %s', v_estado);
     RAISE NOTICE 'A4c OK — respostas válidas aceites';
+END $$;
+
+-- Limpeza dos dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key IN ('a1-fixture','a2-credito','a2-estorno','a2-perdido','a4a-numero','a4b-multipla','a4c-valido');
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_agenda_com_anamnese(TEXT, INT, TEXT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_paga_sinal(UUID, TEXT, NUMERIC);
 END $$;

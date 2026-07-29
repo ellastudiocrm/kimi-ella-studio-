@@ -11,6 +11,11 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO empresas (id, nome) VALUES ('eeeeeeee-0000-0000-0000-00000000000b', 'Empresa B Teste')
 ON CONFLICT (id) DO NOTHING;
 
+-- Fixture defensiva: cliente da ELLA usado no teste T1
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'Cliente Teste', '5519999990001')
+ON CONFLICT (id) DO NOTHING;
+
 INSERT INTO usuarios_internos (id, auth_user_id, empresa_id, email, nome, perfil) VALUES
 ('99999999-0000-0000-0000-000000000001', 'ffffffff-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'admin@ella.test', 'Admin ELLA', 'admin'),
 ('99999999-0000-0000-0000-000000000002', 'ffffffff-0000-0000-0000-000000000002', 'eeeeeeee-0000-0000-0000-00000000000b', 'recepcao@b.test', 'Receção B', 'recepcao'),
@@ -244,4 +249,53 @@ BEGIN
         ASSERT SQLERRM LIKE '%violates foreign key%', format('T10 erro inesperado: %s', SQLERRM);
         RAISE NOTICE 'T10 OK — FK composta impede cruzamento entre empresas';
     END;
+END $$;
+
+-- Limpeza dos dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key LIKE 'rls-%';
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
 END $$;

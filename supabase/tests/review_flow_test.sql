@@ -9,6 +9,52 @@ LANGUAGE sql STABLE AS $$
     SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
 $$;
 
+-- Fixtures defensivas
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'teste_pagamento', '11111111-1111-1111-1111-111111111111', 60, 100.00, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+
+INSERT INTO auth.users (id) VALUES
+('ffffffff-0000-0000-0000-000000000001'),
+('ffffffff-0000-0000-0000-000000000002')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO usuarios_internos (id, auth_user_id, empresa_id, email, nome, perfil) VALUES
+('99999999-0000-0000-0000-000000000001', 'ffffffff-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'admin@ella.test', 'Admin ELLA', 'admin'),
+('99999999-0000-0000-0000-000000000002', 'ffffffff-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'recepcao@ella.test', 'Recepção ELLA', 'recepcao')
+ON CONFLICT (auth_user_id) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'Cliente Pagamento', '5519999990011')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('33333333-3333-3333-3333-333333333333', 2, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 3, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 4, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 5, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 6, '09:00', '13:00')
+ON CONFLICT DO NOTHING;
+
+-- Helper: cria pré-reserva e devolve id
+CREATE OR REPLACE FUNCTION teste_cria_reserva(dow INT, hora TEXT, chave TEXT) RETURNS UUID
+LANGUAGE sql VOLATILE AS $$
+    SELECT (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'cardapio','ella_studio',
+            'inicio', teste_proximo_dia(dow, hora))), chave) ->> 'reserva_id')::UUID
+$$;
+
+-- Helper: paga o sinal de uma reserva
+CREATE OR REPLACE FUNCTION teste_paga_sinal(p_reserva UUID, p_finalidade TEXT, p_valor NUMERIC) RETURNS VOID
+LANGUAGE sql VOLATILE AS $$
+    INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
+    SELECT c.id, c.empresa_id, 'teste-' || gen_random_uuid()::TEXT, p_valor, 'pix', p_finalidade, 'pago'
+    FROM cobrancas c WHERE c.reserva_id = p_reserva
+$$;
+
 -- Helper: cria reserva paga ATRASADA (em pagamento_em_revisao) e devolve a revisão
 CREATE OR REPLACE FUNCTION teste_cria_revisao_atrasada(dow INT, hora TEXT, chave TEXT, valor NUMERIC)
 RETURNS UUID
@@ -29,7 +75,7 @@ END $$;
 DO $$
 DECLARE v_rev UUID; v_res JSONB; v_r UUID;
 BEGIN
-    v_rev := teste_cria_revisao_atrasada(5, '09:00', 'rev-r1', 30.00);
+    v_rev := teste_cria_revisao_atrasada(5, '17:00', 'rev-r1', 30.00);
     SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
 
     v_res := public.resolver_revisao(v_rev, 'confirmar', 'Cliente avisou que o PIX ia atrasar');
@@ -63,11 +109,11 @@ END $$;
 DO $$
 DECLARE v_rev UUID; v_res JSONB; v_r UUID; v_saldo DECIMAL; v_key TEXT;
 BEGIN
-    v_rev := teste_cria_revisao_atrasada(2, '09:00', 'rev-r3', 30.00);
+    v_rev := teste_cria_revisao_atrasada(4, '11:00', 'rev-r3', 30.00);
     SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
 
     -- outro cliente fica com o horário libertado
-    PERFORM teste_cria_reserva(2, '09:00', 'rev-r3-concorrente');
+    PERFORM teste_cria_reserva(4, '11:00', 'rev-r3-concorrente');
 
     BEGIN
         PERFORM public.resolver_revisao(v_rev, 'confirmar', 'tenta reagendar');
@@ -93,7 +139,7 @@ END $$;
 DO $$
 DECLARE v_r UUID; v_rev UUID; v_res JSONB;
 BEGIN
-    v_r := teste_cria_reserva(3, '10:00', 'rev-r4');
+    v_r := teste_cria_reserva(3, '11:00', 'rev-r4');
     PERFORM teste_paga_sinal(v_r, 'sinal', 30.00);
     PERFORM public.confirmar_reserva(v_r);
     PERFORM public.cancelar_reserva(v_r);   -- daqui a 7+ dias → credito_automatico
@@ -115,7 +161,7 @@ END $$;
 DO $$
 DECLARE v_rev UUID; v_res JSONB; v_r UUID;
 BEGIN
-    v_rev := teste_cria_revisao_atrasada(4, '15:00', 'rev-r5', 30.00);
+    v_rev := teste_cria_revisao_atrasada(4, '17:00', 'rev-r5', 30.00);
     SELECT reserva_id INTO v_r FROM revisoes_cancelamento WHERE id = v_rev;
     v_res := public.resolver_revisao(v_rev, 'perdido', 'Cliente não apareceu e não respondeu');
     ASSERT v_res->>'reserva_status' = 'cancelada';
@@ -183,3 +229,62 @@ BEGIN
     END;
 END $$;
 RESET ROLE;
+
+-- Limpeza dos dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key LIKE 'rev-%';
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.jobs
+    WHERE payload->>'reserva_id' IN (
+        SELECT id::TEXT FROM public.reservas
+        WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+          AND idempotencia_key LIKE 'rev-%'
+    );
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_cria_reserva(INT, TEXT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_paga_sinal(UUID, TEXT, NUMERIC);
+    DROP FUNCTION IF EXISTS public.teste_cria_revisao_atrasada(INT, TEXT, NUMERIC);
+END $$;

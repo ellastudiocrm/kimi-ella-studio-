@@ -9,6 +9,35 @@ LANGUAGE sql STABLE AS $$
     SELECT ((CURRENT_DATE + ((dow - EXTRACT(DOW FROM CURRENT_DATE)::INT + 7) % 7 + 7))::TEXT || ' ' || hora)::TIMESTAMPTZ
 $$;
 
+-- Fixtures defensivas
+INSERT INTO servicos (id, empresa_id, nome_tecnico, tipo_recurso_id, duracao_minutos, preco_base, anamnese_obrigatoria) VALUES
+('aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'teste_pagamento', '11111111-1111-1111-1111-111111111111', 60, 100.00, false)
+ON CONFLICT (empresa_id, nome_tecnico) DO NOTHING;
+INSERT INTO profissional_servicos (profissional_id, servico_id, empresa_id) VALUES
+('33333333-3333-3333-3333-333333333333', 'aaaaaaaa-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001')
+ON CONFLICT DO NOTHING;
+INSERT INTO clientes (id, empresa_id, nome, telefone_normalizado) VALUES
+('cccccccc-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001', 'Cliente Pagamento', '5519999990011')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO horarios_profissional (profissional_id, dia_semana, abertura, fechamento) VALUES
+('33333333-3333-3333-3333-333333333333', 2, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 3, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 4, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 5, '09:00', '17:00'),
+('33333333-3333-3333-3333-333333333333', 6, '09:00', '13:00')
+ON CONFLICT DO NOTHING;
+
+-- Helper: cria pré-reserva e devolve id
+CREATE OR REPLACE FUNCTION teste_cria_reserva(dow INT, hora TEXT, chave TEXT) RETURNS UUID
+LANGUAGE sql VOLATILE AS $$
+    SELECT (public.criar_pre_reserva('00000000-0000-0000-0000-000000000001',
+        'cccccccc-0000-0000-0000-000000000011',
+        jsonb_build_array(jsonb_build_object('servico_id','aaaaaaaa-0000-0000-0000-000000000011',
+            'profissional_id','33333333-3333-3333-3333-333333333333',
+            'cardapio','ella_studio',
+            'inicio', teste_proximo_dia(dow, hora))), chave) ->> 'reserva_id')::UUID
+$$;
+
 -- W1: webhook no prazo → confirma TUDO na mesma transação
 DO $$
 DECLARE v_r UUID; v_cob UUID; v_res JSONB;
@@ -91,7 +120,7 @@ END $$;
 DO $$
 DECLARE v_r UUID; v_cob UUID; v_res JSONB; v_inbox INT;
 BEGIN
-    v_r := teste_cria_reserva(6, '12:00', 'wh-5');
+    v_r := teste_cria_reserva(6, '12:30', 'wh-5');
     SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
 
     BEGIN
@@ -115,7 +144,7 @@ END $$;
 DO $$
 DECLARE v_r UUID; v_cob UUID; v_tx UUID; v_res JSONB;
 BEGIN
-    v_r := teste_cria_reserva(5, '15:00', 'wh-6');
+    v_r := teste_cria_reserva(5, '16:00', 'wh-6');
     SELECT id INTO v_cob FROM cobrancas WHERE reserva_id = v_r;
     INSERT INTO transacoes (cobranca_id, empresa_id, mp_idempotency_key, valor, meio, finalidade, estado)
     VALUES (v_cob, '00000000-0000-0000-0000-000000000001', 'w6-pending', 30.00, 'pix', 'sinal', 'pendente')
@@ -162,4 +191,56 @@ BEGIN
         NULL, v_cob, 'mp-tx-w8b', '{}'::JSONB, true);
     ASSERT v_res->>'status' = 'confirmada', format('W8b: status %s', v_res->>'status');
     RAISE NOTICE 'W8 OK — parcial no prazo aguarda; complemento confirma';
+END $$;
+
+-- Limpeza dos dados criados por esta suíte
+DO $$
+DECLARE
+    v_reserva_ids UUID[];
+BEGIN
+    SELECT array_agg(id) INTO v_reserva_ids
+    FROM public.reservas
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND idempotencia_key LIKE 'wh-%';
+
+    IF v_reserva_ids IS NOT NULL AND array_length(v_reserva_ids, 1) > 0 THEN
+        DELETE FROM public.eventos_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.alocacoes_pagamento WHERE transacao_id IN (
+            SELECT id FROM public.transacoes WHERE cobranca_id IN (
+                SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.transacoes WHERE cobranca_id IN (
+            SELECT id FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.revisoes_cancelamento WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamnese_respostas WHERE anamnese_id IN (
+            SELECT id FROM public.anamneses WHERE reserva_item_id IN (
+                SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+            )
+        );
+        DELETE FROM public.anamnese_tokens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.anamneses WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.cobrancas WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.agenda_ocupacoes WHERE reserva_item_id IN (
+            SELECT id FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids)
+        );
+        DELETE FROM public.reserva_itens WHERE reserva_id = ANY(v_reserva_ids);
+        DELETE FROM public.reservas WHERE id = ANY(v_reserva_ids);
+    END IF;
+
+    DELETE FROM public.webhook_inbox WHERE external_event_id LIKE 'evt-w%';
+
+    DELETE FROM public.excecoes_calendario
+    WHERE empresa_id = '00000000-0000-0000-0000-000000000001'
+      AND motivo LIKE 'Teste%';
+
+    DROP FUNCTION IF EXISTS public.teste_proximo_dia(INT, TEXT);
+    DROP FUNCTION IF EXISTS public.teste_cria_reserva(INT, TEXT, TEXT);
 END $$;
