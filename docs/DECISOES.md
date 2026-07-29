@@ -27,17 +27,6 @@
 
 **Nota técnica:** O fallback `COALESCE(v_item->>'cardapio', 'feminino')` foi removido. A aplicação/frontend **tem de enviar** o cardápio em cada item. Valores antigos `'feminino'`/`'masculino'` são **rejeitados** pelo banco.
 
-| Campo | Valor |
-|---|---|
-| **Data** | 2026-07-27 |
-| **Quem** | Dono do estúdio (Neri / Laira) |
-| **O quê** | O campo `cardapio` passa a ser **obrigatório** em `criar_pre_reserva`. Se vier vazio ou null, a RPC rejeita com mensagem clara. |
-| **Porquê** | Nunca assumir um cardápio default. A atendente (Ella) pergunta sempre ao cliente. O frontend futuro também terá de perguntar. |
-| **Mensagem de erro** | `"Indica o cardápio: ella_studio ou ella_men"` |
-| **Valores válidos** | `'ella_studio'` (feminino), `'ella_men'` (masculino) |
-
-**Nota técnica:** O fallback `COALESCE(v_item->>'cardapio', 'feminino')` foi removido. A aplicação/frontend **tem de enviar** o cardápio em cada item.
-
 ---
 
 ## Decisão 2 — Sinal 30% fixo (fase inicial)
