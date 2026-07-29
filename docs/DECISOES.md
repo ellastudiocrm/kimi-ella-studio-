@@ -56,6 +56,24 @@
 
 ---
 
+## Decisão 4 — Frontend-ready e leitura pública (v3.4.4)
+
+| Campo | Valor |
+|---|---|
+| **Data** | 2026-07-29 |
+| **Quem** | Dono do estúdio (Neri / Laira) |
+| **O quê** | Preparar o backend para app web Next.js: catálogo público de serviços/profissionais, slots de agenda públicos, e agendamento anónimo seguro. |
+| **Porquê** | A cliente escolhe serviço e horário no browser sem login; o estúdio controla tudo pelo backoffice. |
+
+**Sub-decisões v3.4.4:**
+
+1. **Cardápio obrigatório na RPC de slots:** `listar_horarios_disponiveis` exige cardápio ativo em `servico_cardapios`. Sem cardápio, a função retorna vazio — nunca usa preço/duração do serviço base como fallback.
+2. **Agendamento anónimo via API route server-side:** `criar_pre_reserva` **nunca** ganha `GRANT` a `anon`. A página pública chama uma API route Next.js que valida os dados e invoca a RPC com `service_role`.
+3. **Escrita de storage validada na API route:** buckets `servicos` e `profissionais` são públicos para leitura, mas upload/delete só acontecem via API route server-side (validação de empresa e perfil no backend), nunca diretamente pelo browser.
+4. **Correção da regra de última entrada em ajustes:** horários de **ajuste** (`excecoes_calendario.tipo = 'ajuste'`) exigem que o serviço caiba **inteiro** no intervalo; a exceção de "última entrada do dia" aplica-se apenas a horários recorrentes.
+
+---
+
 ## Decisões pendentes (registro histórico)
 
 | # | Tema | Estado | Notas |
@@ -66,7 +84,7 @@
 
 ---
 
-*Última atualização: 2026-07-27 · v3.4.3*
+*Última atualização: 2026-07-29 · v3.4.4*
 
 ---
 

@@ -1,4 +1,4 @@
-# AGENTS.md — CRM ELLA Studio v3.4.3
+# AGENTS.md — CRM ELLA Studio v3.4.4
 
 > Ficheiro orientador para agentes de código. Baseado no conteúdo real do repositório.
 
@@ -8,7 +8,7 @@
 
 O **CRM ELLA Studio** é um sistema de gestão de estética/beleza (agendamentos, pagamentos, anamnese, créditos, pacotes, bloqueios de agenda).
 
-- **Versão atual:** v3.4.3
+- **Versão atual:** v3.4.4
 - **Stack:** PostgreSQL 15 + Supabase (Auth, RLS, Edge Functions opcionais)
 - **Linguagem do projeto:** português (nomes de tabelas, colunas, funções, comentários, documentação)
 - **Project ID Supabase:** `crmellastudioblz`
@@ -16,8 +16,9 @@ O **CRM ELLA Studio** é um sistema de gestão de estética/beleza (agendamentos
 
 ### Ficheiros de verdade
 
-- `supabase/migrations/001_extensions.sql` … `016_consolidacao_seguranca.sql`
+- `supabase/migrations/001_extensions.sql` … `017_frontend_ready.sql`
 - `supabase/seed.sql`
+- `docs/CATALOGO_SERVICOS_ELLA.md` — catálogo oficial de 24 serviços (14 ELLA Studio + 10 ELLA MEN)
 - `supabase/tests/*.sql`
 - `docs/DECISOES.md` — decisões de negócio oficiais
 - `docs/VERIFICACOES.md` — escolhas conscientes documentadas
@@ -60,7 +61,7 @@ O **CRM ELLA Studio** é um sistema de gestão de estética/beleza (agendamentos
 ```
 crm-ella/
 ├── supabase/
-│   ├── migrations/          # 16 migrations numeradas (imutáveis)
+│   ├── migrations/          # 17 migrations numeradas (imutáveis)
 │   │   ├── 001_extensions.sql
 │   │   ├── 002_core.sql
 │   │   ├── 003_catalog.sql
@@ -76,9 +77,10 @@ crm-ella/
 │   │   ├── 013_decisoes_negocio.sql
 │   │   ├── 014_auditoria2_fixes.sql
 │   │   ├── 015_fix_cobranca_revisao.sql
-│   │   └── 016_consolidacao_seguranca.sql
-│   ├── seed.sql             # dados iniciais ELLA Studio
-│   └── tests/               # 12 suítes oficiais
+│   │   ├── 016_consolidacao_seguranca.sql
+│   │   └── 017_frontend_ready.sql
+│   ├── seed.sql             # dados iniciais ELLA Studio (24 serviços)
+│   └── tests/               # 13 suítes oficiais / 258 asserts
 │       ├── 000_test_setup.sql        # AMBIENTE LOCAL APENAS
 │       ├── schedule_test.sql
 │       ├── payment_race_test.sql
@@ -91,7 +93,8 @@ crm-ella/
 │       ├── concurrency_test.sql
 │       ├── v341_fixes_test.sql
 │       ├── decisoes_test.sql
-│       └── auditoria2_test.sql
+│       ├── auditoria2_test.sql
+│       └── frontend_ready_test.sql   # 20 asserts — RLS anon + RPC slots
 ├── docs/
 │   ├── DECISOES.md
 │   └── VERIFICACOES.md
@@ -101,9 +104,9 @@ crm-ella/
 
 ### Superfície RPC pública
 
-Funções expostas a `authenticated` / `service_role`:
+Funções expostas (16 RPCs):
 
-- `criar_pre_reserva(empresa, cliente, itens, chave)`
+- `criar_pre_reserva(empresa, cliente, itens, chave)` — **nunca `anon`**; frontend chama via API route server-side
 - `confirmar_reserva(reserva)`
 - `cancelar_reserva(reserva, exceção, motivo)`
 - `cancelar_item_reserva(item, exceção, motivo)`
@@ -118,6 +121,7 @@ Funções expostas a `authenticated` / `service_role`:
 - `revisar_anamnese(ficha, estado)`
 - `regenerar_token_anamnese(ficha)`
 - `expirar_pre_reservas(limite)` — **só `service_role`**
+- `listar_horarios_disponiveis(empresa, serviço, profissional, data, cardápio, intervalo, limite)` — **também `anon`** (leitura pública de slots)
 
 Helpers internos críticos (não expor):
 
@@ -157,8 +161,8 @@ Helpers internos críticos (não expor):
 ### Ambiente Supabase
 
 1. Ativar extensões: `btree_gist`, `pgcrypto`, `uuid-ossp`, `pg_cron`.
-2. Aplicar `001` → `016` pela ordem.
-3. Aplicar `seed.sql` em staging (não em produção sem adaptação).
+2. Aplicar `001` → `017` pela ordem.
+3. Aplicar `seed.sql` em staging (não em produção sem adaptação). O seed reflete o catálogo oficial de **24 serviços** (`docs/CATALOGO_SERVICOS_ELLA.md`).
 4. Verificar cron: `SELECT * FROM cron.job WHERE jobname = 'expirar-pre-reservas';`
 
 ### Ambiente local
@@ -166,7 +170,7 @@ Helpers internos críticos (não expor):
 ```bash
 psql -U postgres -d crm_ella -f supabase/tests/000_test_setup.sql
 psql -U postgres -d crm_ella -f supabase/migrations/001_extensions.sql
-# ... 002 a 016
+# ... 002 a 017
 psql -U postgres -d crm_ella -f supabase/seed.sql
 ```
 
@@ -181,9 +185,9 @@ Os testes são ficheiros SQL autónomos com `DO $$ ... ASSERT ... END $$;`.
 ### Ordem recomendada
 
 1. `000_test_setup.sql` (local apenas)
-2. Migrations `001` → `016`
+2. Migrations `001` → `017`
 3. `seed.sql`
-4. Suítes na ordem:
+4. Suítes na ordem (13 suítes / 258 asserts):
    - `schedule_test.sql`
    - `payment_race_test.sql`
    - `rls_test.sql`
@@ -196,6 +200,7 @@ Os testes são ficheiros SQL autónomos com `DO $$ ... ASSERT ... END $$;`.
    - `v341_fixes_test.sql`
    - `decisoes_test.sql`
    - `auditoria2_test.sql`
+   - `frontend_ready_test.sql`
 
 ### Comando
 
@@ -215,6 +220,9 @@ psql -U postgres -d crm_ella -v ON_ERROR_STOP=1 -f supabase/tests/schedule_test.
 - **Webhooks:** `processar_pagamento_webhook` é só `service_role`.
 - **Deadlock:** ordem de lock `reserva → cobrança → transacao`.
 - **Revisões:** no máximo uma revisão aberta por reserva/item.
+- **Leitura pública (`anon`):** catálogo (`servicos`, `servico_cardapios`, `profissionais`, `profissional_fotos`) exposto via **RLS de linha + GRANT de coluna**; colunas internas (`empresa_id`, `created_at`, `modelo_anamnese_id`, etc.) nunca expostas.
+- **Agendamento público:** `criar_pre_reserva` **nunca é exposta a `anon`**; a página pública chama uma API route server-side que usa `service_role`.
+- **Storage:** buckets `servicos` e `profissionais` são públicos para leitura; escrita só via API route server-side (validação de empresa e perfil no backend).
 
 ---
 
@@ -234,3 +242,16 @@ psql -U postgres -d crm_ella -v ON_ERROR_STOP=1 -f supabase/tests/schedule_test.
 - [ ] Verificar RLS/privilégios quando adicionar tabela ou RPC.
 - [ ] Correr todas as suítes com `ON_ERROR_STOP=1` e confirmar 0 falhas.
 - [ ] Atualizar `AGENTS.md` se a mudança mudar arquitetura ou processo.
+
+---
+
+## 10. Frontend-ready (v3.4.4)
+
+A migration `017_frontend_ready.sql` prepara o backend para a app web Next.js:
+
+- **Schema:** `foto_url` em `servicos`; `especialidades` e `foto_url` em `profissionais`; nova tabela `profissional_fotos`.
+- **Leitura pública:** `anon` lê `servicos`, `servico_cardapios`, `profissionais` e `profissional_fotos` via **RLS de linha + GRANT de coluna**; colunas internas (`empresa_id`, `created_at`, `modelo_anamnese_id`) ficam escondidas.
+- **RPC pública:** `listar_horarios_disponiveis` exposta a `anon` e `authenticated`; respeita duração do serviço, bloqueios, agenda_ocupacoes, horários de empresa/profissional, exceções e a regra de "última entrada" da migração 012.
+- **Cardápio obrigatório:** a RPC não faz fallback para preço/duração do serviço base; sem `servico_cardapios` ativo para o par `(servico_id, cardapio)`, retorna vazio.
+- **Storage:** buckets `servicos` e `profissionais` criados; leitura pública, escrita validada em API route server-side.
+- **Agendamento anónimo:** `criar_pre_reserva` permanece sem GRANT a `anon`; o browser chama `/api/pre-reserva` (Next.js) que usa `service_role`.

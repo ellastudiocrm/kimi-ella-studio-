@@ -332,7 +332,7 @@ BEGIN
         END LOOP;
     END IF;
 
-    IF v_intersecoes IS NULL OR array_length(v_intersecoes, 1) = 0 THEN
+    IF v_intersecoes IS NULL OR v_intersecoes = '{}'::int4range[] THEN
         RETURN;
     END IF;
 
