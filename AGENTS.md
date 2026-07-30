@@ -255,3 +255,20 @@ A migration `017_frontend_ready.sql` prepara o backend para a app web Next.js:
 - **Cardápio obrigatório:** a RPC não faz fallback para preço/duração do serviço base; sem `servico_cardapios` ativo para o par `(servico_id, cardapio)`, retorna vazio.
 - **Storage:** buckets `servicos` e `profissionais` criados; leitura pública, escrita validada em API route server-side.
 - **Agendamento anónimo:** `criar_pre_reserva` permanece sem GRANT a `anon`; o browser chama `/api/pre-reserva` (Next.js) que usa `service_role`.
+
+---
+
+## 11. Frontend — design mobile-first
+
+> Regra permanente a partir de 2026-07-30.
+
+- Todo o frontend se desenha **primeiro para telemóvel (375px)** e só depois se adapta a desktop (`md:`/`lg:` do Tailwind).
+- **Prioridade telemóvel:** página pública de agendamento, ficha pública do profissional, agenda/confirmações do profissional.
+- **Desktop-first só:** catálogo, relatórios, configurações da receção — mas mesmo esses têm de ser usáveis no telemóvel.
+- **Regras práticas:**
+  - Botões com altura mínima de **44px** (conforto do polegar).
+  - Navegação principal por baixo em telemóvel.
+  - Tabelas largas viram **cartões empilhados** em telemóvel.
+  - Imagens otimizadas (`next/image`, lazy loading).
+  - Calendários e horários são tocáveis.
+- **Critério de aceite de cada etapa:** teste em viewport **375px** (Chrome DevTools) sem scroll horizontal.

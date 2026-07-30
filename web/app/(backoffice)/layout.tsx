@@ -28,6 +28,9 @@ export default async function BackofficeLayout({
               <a href="/dashboard/servicos" className="text-gray-600 hover:text-pink-600">
                 Serviços
               </a>
+              <a href="/dashboard/profissionais" className="text-gray-600 hover:text-pink-600">
+                Profissionais
+              </a>
             </nav>
           </div>
           <p className="text-sm text-gray-600">{user.email}</p>
