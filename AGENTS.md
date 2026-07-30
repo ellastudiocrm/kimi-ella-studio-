@@ -156,7 +156,7 @@ Helpers internos críticos (não expor):
 
 ## 5. Migrations
 
-> **Regra permanente:** Migrations aplicadas são **imutáveis**. Correções entram sempre como **migration nova numerada sequencialmente**.
+> **Regra permanente:** Migrations aplicadas são **imutáveis** — incluindo na base linked do Supabase. Correções entram sempre como **migration nova numerada sequencialmente** (018, 019, ...). Nunca editar ou reaplicar uma migration já aplicada, mesmo que a correção pareça semanticamente idêntica. A edição da `017` já aplicada foi uma exceção única autorizada porque era semanticamente idêntica e só existia em staging.
 
 ### Ambiente Supabase
 
