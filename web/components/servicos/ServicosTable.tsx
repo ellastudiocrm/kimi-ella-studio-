@@ -14,6 +14,8 @@ interface Cardapio {
 interface Servico {
   id: string
   nome_tecnico: string
+  nome_comercial: string
+  tipo_recurso_id: string
   duracao_minutos: number
   preco_base: number
   percentual_sinal: number
@@ -26,6 +28,13 @@ interface Servico {
 interface Props {
   servicos: Servico[]
 }
+
+const RECURSOS = [
+  { id: '11111111-1111-1111-1111-111111111111', nome: 'Mesa de manicure' },
+  { id: '11111111-1111-1111-1111-111111111112', nome: 'Cadeira de pedicure' },
+  { id: '11111111-1111-1111-1111-111111111113', nome: 'Cadeira de cílios/sobrancelhas' },
+  { id: '11111111-1111-1111-1111-111111111114', nome: 'Sala de estética' },
+]
 
 export default function ServicosTable({ servicos }: Props) {
   const router = useRouter()
@@ -52,12 +61,18 @@ export default function ServicosTable({ servicos }: Props) {
   function abrirEdicao(servico: Servico) {
     setEditando(servico)
     setForm({
+      nome_tecnico: servico.nome_tecnico,
+      nome_comercial: servico.nome_comercial,
+      tipo_recurso_id: servico.tipo_recurso_id,
       preco_base: servico.preco_base,
       duracao_minutos: servico.duracao_minutos,
+      percentual_sinal: servico.percentual_sinal,
+      anamnese_obrigatoria: servico.anamnese_obrigatoria,
       foto_url: servico.foto_url ?? '',
       ativo: servico.ativo,
       cardapios: servico.servico_cardapios.map((c) => ({ ...c })),
     })
+    setFotoFile(null)
     setErro(null)
   }
 
@@ -119,13 +134,13 @@ export default function ServicosTable({ servicos }: Props) {
     }
   }
 
-  async function uploadFoto(): Promise<string | null> {
-    if (!editando || !fotoFile) return form.foto_url ?? null
+  async function uploadFoto(servicoId: string): Promise<string | null> {
+    if (!fotoFile) return form.foto_url ?? null
 
     setUploadingFoto(true)
     const data = new FormData()
     data.append('file', fotoFile)
-    data.append('servicoId', editando.id)
+    data.append('servicoId', servicoId)
 
     const res = await fetch('/api/upload/servico', {
       method: 'POST',
@@ -149,26 +164,28 @@ export default function ServicosTable({ servicos }: Props) {
     setSalvando(true)
     setErro(null)
 
-    let fotoUrl = form.foto_url ?? null
-    if (fotoFile) {
-      const uploaded = await uploadFoto()
-      if (!uploaded) {
-        setSalvando(false)
-        return
-      }
-      fotoUrl = uploaded
+    const fotoUrl = await uploadFoto(editando.id)
+    if (fotoFile && !fotoUrl) {
+      setSalvando(false)
+      return
     }
 
     const res = await fetch(`/api/servicos/${editando.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        nome_tecnico: form.nome_tecnico,
+        nome_comercial: form.nome_comercial,
+        tipo_recurso_id: form.tipo_recurso_id,
         preco_base: form.preco_base,
         duracao_minutos: form.duracao_minutos,
+        percentual_sinal: form.percentual_sinal,
+        anamnese_obrigatoria: form.anamnese_obrigatoria,
         foto_url: fotoUrl,
         ativo: form.ativo,
         cardapios: form.cardapios?.map((c) => ({
           id: c.id,
+          nome_comercial: c.nome_comercial,
           preco_final: c.preco_final,
           ativo: c.ativo,
         })),
@@ -267,20 +284,43 @@ export default function ServicosTable({ servicos }: Props) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
           <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded bg-white p-6 shadow-lg">
             <h3 className="mb-4 text-lg font-bold text-gray-900">Editar serviço</h3>
-            <p className="mb-4 text-sm text-gray-600">{editando.nome_tecnico}</p>
 
             {erro && <p className="mb-4 text-sm text-red-600">{erro}</p>}
 
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700">Preço base</label>
+                <label className="block text-sm font-medium text-gray-700">Nome técnico</label>
                 <input
-                  type="number"
-                  step="0.01"
-                  value={form.preco_base ?? ''}
-                  onChange={(e) => setForm({ ...form, preco_base: parseFloat(e.target.value) })}
+                  type="text"
+                  value={form.nome_tecnico ?? ''}
+                  onChange={(e) => setForm({ ...form, nome_tecnico: e.target.value })}
                   className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
                 />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Nome comercial</label>
+                <input
+                  type="text"
+                  value={form.nome_comercial ?? ''}
+                  onChange={(e) => setForm({ ...form, nome_comercial: e.target.value })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Tipo de recurso</label>
+                <select
+                  value={form.tipo_recurso_id ?? ''}
+                  onChange={(e) => setForm({ ...form, tipo_recurso_id: e.target.value })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                >
+                  {RECURSOS.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.nome}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <div>
@@ -294,6 +334,39 @@ export default function ServicosTable({ servicos }: Props) {
               </div>
 
               <div>
+                <label className="block text-sm font-medium text-gray-700">Preço base</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={form.preco_base ?? ''}
+                  onChange={(e) => setForm({ ...form, preco_base: parseFloat(e.target.value) })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Percentual sinal (%)</label>
+                <input
+                  type="number"
+                  value={form.percentual_sinal ?? ''}
+                  onChange={(e) => setForm({ ...form, percentual_sinal: parseInt(e.target.value, 10) })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  id="anamnese-edit"
+                  type="checkbox"
+                  checked={form.anamnese_obrigatoria ?? false}
+                  onChange={(e) => setForm({ ...form, anamnese_obrigatoria: e.target.checked })}
+                />
+                <label htmlFor="anamnese-edit" className="text-sm font-medium text-gray-700">
+                  Anamnese obrigatória
+                </label>
+              </div>
+
+              <div>
                 <label className="block text-sm font-medium text-gray-700">Foto do serviço</label>
                 <input
                   ref={fileInputRef}
@@ -304,22 +377,28 @@ export default function ServicosTable({ servicos }: Props) {
                 />
                 {form.foto_url && !fotoFile && (
                   <p className="mt-1 text-xs text-gray-500">
-                    Foto atual: <a href={form.foto_url} target="_blank" rel="noopener noreferrer" className="text-pink-600 underline">ver</a>
+                    Foto atual:{' '}
+                    <a
+                      href={form.foto_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-pink-600 underline"
+                    >
+                      ver
+                    </a>
                   </p>
                 )}
-                {fotoFile && (
-                  <p className="mt-1 text-xs text-gray-500">Nova foto: {fotoFile.name}</p>
-                )}
+                {fotoFile && <p className="mt-1 text-xs text-gray-500">Nova foto: {fotoFile.name}</p>}
               </div>
 
               <div className="flex items-center gap-2">
                 <input
-                  id="ativo"
+                  id="ativo-edit"
                   type="checkbox"
                   checked={form.ativo ?? false}
                   onChange={(e) => setForm({ ...form, ativo: e.target.checked })}
                 />
-                <label htmlFor="ativo" className="text-sm font-medium text-gray-700">
+                <label htmlFor="ativo-edit" className="text-sm font-medium text-gray-700">
                   Ativo
                 </label>
               </div>
@@ -327,19 +406,52 @@ export default function ServicosTable({ servicos }: Props) {
               <div>
                 <label className="block text-sm font-medium text-gray-700">Preços por cardápio</label>
                 {form.cardapios?.map((c, idx) => (
-                  <div key={c.id} className="mt-2 flex items-center gap-3">
-                    <span className="w-24 text-sm">{c.cardapio}</span>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={c.preco_final}
-                      onChange={(e) => {
-                        const novos = [...(form.cardapios ?? [])]
-                        novos[idx].preco_final = parseFloat(e.target.value)
-                        setForm({ ...form, cardapios: novos })
-                      }}
-                      className="w-32 rounded border border-gray-300 px-3 py-2 text-sm"
-                    />
+                  <div key={c.id} className="mt-2 rounded border border-gray-200 p-3">
+                    <p className="mb-2 text-sm font-semibold text-gray-700">{c.cardapio}</p>
+                    <div className="space-y-2">
+                      <div>
+                        <label className="text-xs text-gray-600">Nome comercial no cardápio</label>
+                        <input
+                          type="text"
+                          value={c.nome_comercial}
+                          onChange={(e) => {
+                            const novos = [...(form.cardapios ?? [])]
+                            novos[idx].nome_comercial = e.target.value
+                            setForm({ ...form, cardapios: novos })
+                          }}
+                          className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                        />
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="w-20 text-xs text-gray-600">Preço final</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={c.preco_final}
+                          onChange={(e) => {
+                            const novos = [...(form.cardapios ?? [])]
+                            novos[idx].preco_final = parseFloat(e.target.value)
+                            setForm({ ...form, cardapios: novos })
+                          }}
+                          className="w-32 rounded border border-gray-300 px-3 py-2 text-sm"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          id={`ativo-cardapio-${c.id}`}
+                          type="checkbox"
+                          checked={c.ativo}
+                          onChange={(e) => {
+                            const novos = [...(form.cardapios ?? [])]
+                            novos[idx].ativo = e.target.checked
+                            setForm({ ...form, cardapios: novos })
+                          }}
+                        />
+                        <label htmlFor={`ativo-cardapio-${c.id}`} className="text-sm text-gray-700">
+                          Ativo no cardápio
+                        </label>
+                      </div>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -402,10 +514,11 @@ export default function ServicosTable({ servicos }: Props) {
                   onChange={(e) => setNovoForm({ ...novoForm, tipo_recurso_id: e.target.value })}
                   className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
                 >
-                  <option value="11111111-1111-1111-1111-111111111111">Mesa de manicure</option>
-                  <option value="11111111-1111-1111-1111-111111111112">Cadeira de pedicure</option>
-                  <option value="11111111-1111-1111-1111-111111111113">Cadeira de cílios/sobrancelhas</option>
-                  <option value="11111111-1111-1111-1111-111111111114">Sala de estética</option>
+                  {RECURSOS.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.nome}
+                    </option>
+                  ))}
                 </select>
               </div>
 

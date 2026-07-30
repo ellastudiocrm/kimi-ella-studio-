@@ -18,6 +18,8 @@ export default async function ServicosPage() {
     .select(`
       id,
       nome_tecnico,
+      nome_comercial,
+      tipo_recurso_id,
       duracao_minutos,
       preco_base,
       percentual_sinal,
