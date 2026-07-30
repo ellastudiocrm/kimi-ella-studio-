@@ -1,2 +1,0 @@
-Suíte 10: decisoes_test: FAIL
-Suíte 11: auditoria2_test: FAIL

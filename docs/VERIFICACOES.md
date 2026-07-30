@@ -22,3 +22,19 @@ Por agora, `'cancelada'` cobre todos os casos de reserva em revisão; e `'sinal_
 **Data:** 2026-07-27
 **Versão:** v3.4.3
 **Migration:** `014_auditoria2_fixes.sql`
+
+---
+
+## Observação 002 — Exceção única de edição da migration 017 (v3.4.4)
+
+**Contexto:** A migration `017_frontend_ready.sql` foi aplicada na base linked e depois editada no repositório para trocar `array_length(v_intersecoes, 1) = 0` por `v_intersecoes = '{}'::int4range[]`.
+
+**Decisão implementada:** A alteração foi reaplicada na base linked como exceção autorizada.
+
+**Justificação:** A mudança era semanticamente idêntica (ambas detectam array vazio) e a migration 017 só existia em staging — ainda não tinha sido promovida a produção. A reaplicação não alterou comportamento de negócio nem quebrou a suíte: **258/258 asserts verdes**.
+
+**Regra reforçada:** A partir desta data, TODA a migration aplicada na base linked é imutável. Qualquer correção subsequente entra obrigatoriamente como migration nova numerada sequencialmente (018, 019, ...).
+
+**Data:** 2026-07-29
+**Versão:** v3.4.4
+**Migration:** `017_frontend_ready.sql`

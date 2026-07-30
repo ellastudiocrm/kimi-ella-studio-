@@ -1,1 +1,16 @@
 supabase-cli/
+
+# Temporários de teste / auditoria (oficiais já commitados ficam no repo)
+tests_result.txt
+_run_*.ps1
+_run_*.sh
+_limpeza_*.sql
+_reset_*.sql
+_truncate_*.sql
+run_*.py
+run_*.bat
+get_cli_url.py
+instalar_cli.ps1
+AUDITORIA_DEPLOY.ps1
+*.log
+Thumbs.db
