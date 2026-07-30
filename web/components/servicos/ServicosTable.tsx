@@ -36,6 +36,17 @@ export default function ServicosTable({ servicos }: Props) {
   const [fotoFile, setFotoFile] = useState<File | null>(null)
   const [uploadingFoto, setUploadingFoto] = useState(false)
   const [tabAtiva, setTabAtiva] = useState<'ella_studio' | 'ella_men'>('ella_studio')
+  const [criando, setCriando] = useState(false)
+  const [novoForm, setNovoForm] = useState({
+    nome_tecnico: '',
+    nome_comercial: '',
+    tipo_recurso_id: '11111111-1111-1111-1111-111111111111',
+    duracao_minutos: 60,
+    preco_base: 0,
+    preco_final: 0,
+    percentual_sinal: 30,
+    anamnese_obrigatoria: false,
+  })
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   function abrirEdicao(servico: Servico) {
@@ -55,6 +66,51 @@ export default function ServicosTable({ servicos }: Props) {
     setForm({})
     setFotoFile(null)
     setErro(null)
+  }
+
+  function abrirCriacao() {
+    setCriando(true)
+    setNovoForm({
+      nome_tecnico: '',
+      nome_comercial: '',
+      tipo_recurso_id: '11111111-1111-1111-1111-111111111111',
+      duracao_minutos: 60,
+      preco_base: 0,
+      preco_final: 0,
+      percentual_sinal: 30,
+      anamnese_obrigatoria: false,
+    })
+    setErro(null)
+  }
+
+  function fecharCriacao() {
+    setCriando(false)
+    setErro(null)
+  }
+
+  async function criarServico() {
+    setSalvando(true)
+    setErro(null)
+
+    const res = await fetch('/api/servicos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...novoForm,
+        cardapio: tabAtiva,
+      }),
+    })
+
+    setSalvando(false)
+
+    if (!res.ok) {
+      const data = await res.json()
+      setErro(data.error || 'Erro ao criar serviço')
+      return
+    }
+
+    fecharCriacao()
+    router.refresh()
   }
 
   function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
@@ -137,26 +193,36 @@ export default function ServicosTable({ servicos }: Props) {
 
   return (
     <div>
-      <div className="mb-4 flex gap-2 border-b">
+      <div className="mb-4 flex items-center justify-between border-b">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setTabAtiva('ella_studio')}
+            className={`px-4 py-2 text-sm font-semibold ${
+              tabAtiva === 'ella_studio'
+                ? 'border-b-2 border-pink-600 text-pink-600'
+                : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            ELLA Studio (Feminino)
+          </button>
+          <button
+            onClick={() => setTabAtiva('ella_men')}
+            className={`px-4 py-2 text-sm font-semibold ${
+              tabAtiva === 'ella_men'
+                ? 'border-b-2 border-blue-600 text-blue-600'
+                : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            ELLA MEN (Masculino)
+          </button>
+        </div>
         <button
-          onClick={() => setTabAtiva('ella_studio')}
-          className={`px-4 py-2 text-sm font-semibold ${
-            tabAtiva === 'ella_studio'
-              ? 'border-b-2 border-pink-600 text-pink-600'
-              : 'text-gray-500 hover:text-gray-700'
+          onClick={abrirCriacao}
+          className={`mb-2 rounded px-4 py-2 text-sm font-semibold text-white ${
+            tabAtiva === 'ella_studio' ? 'bg-pink-600 hover:bg-pink-700' : 'bg-blue-600 hover:bg-blue-700'
           }`}
         >
-          ELLA Studio (Feminino)
-        </button>
-        <button
-          onClick={() => setTabAtiva('ella_men')}
-          className={`px-4 py-2 text-sm font-semibold ${
-            tabAtiva === 'ella_men'
-              ? 'border-b-2 border-blue-600 text-blue-600'
-              : 'text-gray-500 hover:text-gray-700'
-          }`}
-        >
-          ELLA MEN (Masculino)
+          + Novo serviço
         </button>
       </div>
 
@@ -292,6 +358,127 @@ export default function ServicosTable({ servicos }: Props) {
                 className="rounded bg-pink-600 px-4 py-2 text-sm font-semibold text-white hover:bg-pink-700 disabled:opacity-50"
               >
                 {uploadingFoto ? 'A carregar foto...' : salvando ? 'A guardar...' : 'Guardar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {criando && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded bg-white p-6 shadow-lg">
+            <h3 className="mb-4 text-lg font-bold text-gray-900">Novo serviço</h3>
+            <p className="mb-4 text-sm text-gray-600">
+              Cardápio: <strong>{tabAtiva === 'ella_studio' ? 'ELLA Studio' : 'ELLA MEN'}</strong>
+            </p>
+
+            {erro && <p className="mb-4 text-sm text-red-600">{erro}</p>}
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Nome técnico</label>
+                <input
+                  type="text"
+                  value={novoForm.nome_tecnico}
+                  onChange={(e) => setNovoForm({ ...novoForm, nome_tecnico: e.target.value })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Nome comercial</label>
+                <input
+                  type="text"
+                  value={novoForm.nome_comercial}
+                  onChange={(e) => setNovoForm({ ...novoForm, nome_comercial: e.target.value })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Tipo de recurso</label>
+                <select
+                  value={novoForm.tipo_recurso_id}
+                  onChange={(e) => setNovoForm({ ...novoForm, tipo_recurso_id: e.target.value })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                >
+                  <option value="11111111-1111-1111-1111-111111111111">Mesa de manicure</option>
+                  <option value="11111111-1111-1111-1111-111111111112">Cadeira de pedicure</option>
+                  <option value="11111111-1111-1111-1111-111111111113">Cadeira de cílios/sobrancelhas</option>
+                  <option value="11111111-1111-1111-1111-111111111114">Sala de estética</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Duração (minutos)</label>
+                <input
+                  type="number"
+                  value={novoForm.duracao_minutos}
+                  onChange={(e) => setNovoForm({ ...novoForm, duracao_minutos: parseInt(e.target.value, 10) })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Preço base</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={novoForm.preco_base}
+                  onChange={(e) => setNovoForm({ ...novoForm, preco_base: parseFloat(e.target.value) })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Preço final do cardápio</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={novoForm.preco_final}
+                  onChange={(e) => setNovoForm({ ...novoForm, preco_final: parseFloat(e.target.value) })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Percentual sinal (%)</label>
+                <input
+                  type="number"
+                  value={novoForm.percentual_sinal}
+                  onChange={(e) => setNovoForm({ ...novoForm, percentual_sinal: parseInt(e.target.value, 10) })}
+                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  id="anamnese"
+                  type="checkbox"
+                  checked={novoForm.anamnese_obrigatoria}
+                  onChange={(e) => setNovoForm({ ...novoForm, anamnese_obrigatoria: e.target.checked })}
+                />
+                <label htmlFor="anamnese" className="text-sm font-medium text-gray-700">
+                  Anamnese obrigatória
+                </label>
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={fecharCriacao}
+                className="rounded border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={criarServico}
+                disabled={salvando}
+                className={`rounded px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 ${
+                  tabAtiva === 'ella_studio' ? 'bg-pink-600 hover:bg-pink-700' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+              >
+                {salvando ? 'A criar...' : 'Criar serviço'}
               </button>
             </div>
           </div>
