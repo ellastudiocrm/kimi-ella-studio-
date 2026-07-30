@@ -35,6 +35,7 @@ export default function ServicosTable({ servicos }: Props) {
   const [erro, setErro] = useState<string | null>(null)
   const [fotoFile, setFotoFile] = useState<File | null>(null)
   const [uploadingFoto, setUploadingFoto] = useState(false)
+  const [tabAtiva, setTabAtiva] = useState<'ella_studio' | 'ella_men'>('ella_studio')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   function abrirEdicao(servico: Servico) {
@@ -130,43 +131,69 @@ export default function ServicosTable({ servicos }: Props) {
     router.refresh()
   }
 
+  const servicosFiltrados = servicos.filter((s) =>
+    s.servico_cardapios.some((c) => c.cardapio === tabAtiva)
+  )
+
   return (
     <div>
+      <div className="mb-4 flex gap-2 border-b">
+        <button
+          onClick={() => setTabAtiva('ella_studio')}
+          className={`px-4 py-2 text-sm font-semibold ${
+            tabAtiva === 'ella_studio'
+              ? 'border-b-2 border-pink-600 text-pink-600'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          ELLA Studio (Feminino)
+        </button>
+        <button
+          onClick={() => setTabAtiva('ella_men')}
+          className={`px-4 py-2 text-sm font-semibold ${
+            tabAtiva === 'ella_men'
+              ? 'border-b-2 border-blue-600 text-blue-600'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          ELLA MEN (Masculino)
+        </button>
+      </div>
+
       <table className="w-full border-collapse rounded bg-white shadow">
         <thead>
           <tr className="border-b bg-gray-50 text-left text-sm font-semibold text-gray-700">
             <th className="px-4 py-3">Nome técnico</th>
-            <th className="px-4 py-3">Cardápios</th>
+            <th className="px-4 py-3">Nome comercial</th>
             <th className="px-4 py-3">Duração (min)</th>
             <th className="px-4 py-3">Preço base</th>
+            <th className="px-4 py-3">Preço cardápio</th>
             <th className="px-4 py-3">Ativo</th>
             <th className="px-4 py-3"></th>
           </tr>
         </thead>
         <tbody>
-          {servicos.map((servico) => (
-            <tr key={servico.id} className="border-b text-sm text-gray-800">
-              <td className="px-4 py-3">{servico.nome_tecnico}</td>
-              <td className="px-4 py-3">
-                {servico.servico_cardapios.map((c) => (
-                  <div key={c.id}>
-                    {c.cardapio}: {c.nome_comercial} — R$ {c.preco_final.toFixed(2)}
-                  </div>
-                ))}
-              </td>
-              <td className="px-4 py-3">{servico.duracao_minutos}</td>
-              <td className="px-4 py-3">R$ {servico.preco_base.toFixed(2)}</td>
-              <td className="px-4 py-3">{servico.ativo ? 'Sim' : 'Não'}</td>
-              <td className="px-4 py-3">
-                <button
-                  onClick={() => abrirEdicao(servico)}
-                  className="rounded bg-pink-600 px-3 py-1 text-xs font-semibold text-white hover:bg-pink-700"
-                >
-                  Editar
-                </button>
-              </td>
-            </tr>
-          ))}
+          {servicosFiltrados.map((servico) => {
+            const cardapio = servico.servico_cardapios.find((c) => c.cardapio === tabAtiva)
+            return (
+              <tr key={servico.id} className="border-b text-sm text-gray-800">
+                <td className="px-4 py-3">{servico.nome_tecnico}</td>
+                <td className="px-4 py-3">{cardapio?.nome_comercial ?? '-'}</td>
+                <td className="px-4 py-3">{servico.duracao_minutos}</td>
+                <td className="px-4 py-3">R$ {servico.preco_base.toFixed(2)}</td>
+                <td className="px-4 py-3">R$ {(cardapio?.preco_final ?? 0).toFixed(2)}</td>
+                <td className="px-4 py-3">{servico.ativo ? 'Sim' : 'Não'}</td>
+                <td className="px-4 py-3">
+                  <button
+                    onClick={() => abrirEdicao(servico)}
+                    className="rounded bg-pink-600 px-3 py-1 text-xs font-semibold text-white hover:bg-pink-700"
+                  >
+                    Editar
+                  </button>
+                </td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
 
