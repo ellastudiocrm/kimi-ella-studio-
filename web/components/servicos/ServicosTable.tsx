@@ -14,7 +14,6 @@ interface Cardapio {
 interface Servico {
   id: string
   nome_tecnico: string
-  nome_comercial: string
   tipo_recurso_id: string
   duracao_minutos: number
   preco_base: number
@@ -62,7 +61,6 @@ export default function ServicosTable({ servicos }: Props) {
     setEditando(servico)
     setForm({
       nome_tecnico: servico.nome_tecnico,
-      nome_comercial: servico.nome_comercial,
       tipo_recurso_id: servico.tipo_recurso_id,
       preco_base: servico.preco_base,
       duracao_minutos: servico.duracao_minutos,
@@ -175,7 +173,6 @@ export default function ServicosTable({ servicos }: Props) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         nome_tecnico: form.nome_tecnico,
-        nome_comercial: form.nome_comercial,
         tipo_recurso_id: form.tipo_recurso_id,
         preco_base: form.preco_base,
         duracao_minutos: form.duracao_minutos,
@@ -294,16 +291,6 @@ export default function ServicosTable({ servicos }: Props) {
                   type="text"
                   value={form.nome_tecnico ?? ''}
                   onChange={(e) => setForm({ ...form, nome_tecnico: e.target.value })}
-                  className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Nome comercial</label>
-                <input
-                  type="text"
-                  value={form.nome_comercial ?? ''}
-                  onChange={(e) => setForm({ ...form, nome_comercial: e.target.value })}
                   className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
                 />
               </div>
