@@ -1,4 +1,4 @@
-# DECISÕES.md — CRM ELLA Studio
+# DECISÕES.md — CRM ELLA Studio v3.4.4
 
 > Fonte oficial de decisões de negócio. As decisões aqui registradas têm prioridade sobre qualquer comportamento default no código.
 

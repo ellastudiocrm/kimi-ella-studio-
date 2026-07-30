@@ -2,6 +2,7 @@ supabase-cli/
 
 # Temporários de teste / auditoria (oficiais já commitados ficam no repo)
 tests_result.txt
+auditoria_resultado.txt
 _run_*.ps1
 _run_*.sh
 _limpeza_*.sql
