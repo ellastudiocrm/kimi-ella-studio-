@@ -14,3 +14,5 @@ instalar_cli.ps1
 AUDITORIA_DEPLOY.ps1
 *.log
 Thumbs.db
+# env files (root)
+.env*
