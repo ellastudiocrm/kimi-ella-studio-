@@ -1,0 +1,20 @@
+# dependências
+/node_modules
+/.pnp
+.pnp.js
+
+# build
+/.next
+/out/
+
+# ambientes
+.env*.local
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# sistema
+.DS_Store
+Thumbs.db
