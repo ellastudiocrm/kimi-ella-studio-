@@ -38,11 +38,13 @@ export default async function DashboardPage() {
 
   const { data: usuario } = await supabase
     .from('usuarios_internos')
-    .select('perfil, profissional_id')
+    .select('perfil, usuario_profissional(profissional_id)')
     .eq('auth_user_id', user.id)
     .single()
 
-  if (!usuario?.profissional_id) {
+  const profissionalId = (usuario as any)?.usuario_profissional?.[0]?.profissional_id
+
+  if (!profissionalId) {
     return (
       <div className="text-center py-12">
         <p className="text-gray-500">Esta conta não está vinculada a uma profissional.</p>
@@ -76,7 +78,7 @@ export default async function DashboardPage() {
         servico_cardapios (nome_comercial, cardapio)
       )
     `)
-    .eq('profissional_id', usuario.profissional_id)
+    .eq('profissional_id', profissionalId)
     .gte('inicio', `${hoje}T00:00:00`)
     .lt('inicio', `${amanha}T00:00:00`)
     .order('inicio', { ascending: true })
