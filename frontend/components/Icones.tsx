@@ -72,6 +72,49 @@ export function IconePessoa({ className }: Props) {
   )
 }
 
+export function IconeCasa({ className }: Props) {
+  return (
+    <svg {...base} className={className}>
+      <path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z" />
+    </svg>
+  )
+}
+
+export function IconeGrupo({ className }: Props) {
+  return (
+    <svg {...base} className={className}>
+      <circle cx="9" cy="8" r="3.5" />
+      <path d="M2.5 20c.9-3.3 3.4-5 6.5-5s5.6 1.7 6.5 5" />
+      <path d="M16 4.8a3.5 3.5 0 0 1 0 6.4M18.5 15.3c1.4.8 2.4 2.4 3 4.7" />
+    </svg>
+  )
+}
+
+export function IconeSair({ className }: Props) {
+  return (
+    <svg {...base} className={className}>
+      <path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10" />
+    </svg>
+  )
+}
+
+export function IconeMais({ className }: Props) {
+  return (
+    <svg {...base} className={className}>
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  )
+}
+
+export function IconeCadeado({ className }: Props) {
+  return (
+    <svg {...base} className={className}>
+      <rect x="5" y="10.5" width="14" height="10" rx="2" />
+      <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3" />
+    </svg>
+  )
+}
+
 export function IconeInstagram({ className }: Props) {
   return (
     <svg {...base} className={className}>

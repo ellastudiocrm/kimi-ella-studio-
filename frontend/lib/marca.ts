@@ -120,6 +120,30 @@ export function formatarDataLonga(dataISO: string) {
   }).format(new Date(Date.UTC(a, m - 1, d, 12)))
 }
 
+// Minutos desde a meia-noite (horário de São Paulo)
+export function minutosDoDia(iso: string) {
+  const [h, m] = formatarHora(iso).split(':').map(Number)
+  return h * 60 + m
+}
+
+// Soma dias a uma data 'AAAA-MM-DD'
+export function somarDias(dataISO: string, dias: number) {
+  const [a, m, d] = dataISO.split('-').map(Number)
+  return new Date(Date.UTC(a, m - 1, d + dias)).toISOString().slice(0, 10)
+}
+
+export function diaDaSemanaISO(dataISO: string) {
+  const [a, m, d] = dataISO.split('-').map(Number)
+  return new Date(Date.UTC(a, m - 1, d)).getUTCDay()
+}
+
+export function formatarDataCurta(dataISO: string) {
+  const [a, m, d] = dataISO.split('-').map(Number)
+  return new Intl.DateTimeFormat('pt-BR', { timeZone: 'UTC', weekday: 'short', day: 'numeric' })
+    .format(new Date(Date.UTC(a, m - 1, d, 12)))
+    .replace('.', '')
+}
+
 export function dataDoSlot(iso: string) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: FUSO }).format(new Date(iso))
 }
