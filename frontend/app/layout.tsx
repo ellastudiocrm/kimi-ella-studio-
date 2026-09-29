@@ -1,16 +1,34 @@
 import type { Metadata, Viewport } from 'next'
+import { Cormorant_Garamond, Jost } from 'next/font/google'
 import './globals.css'
 
+const cormorant = Cormorant_Garamond({
+  subsets: ['latin'],
+  weight: ['400', '500', '600'],
+  style: ['normal', 'italic'],
+  variable: '--font-cormorant',
+  display: 'swap',
+})
+
+const jost = Jost({
+  subsets: ['latin'],
+  weight: ['300', '400', '500', '600'],
+  variable: '--font-jost',
+  display: 'swap',
+})
+
 export const metadata: Metadata = {
-  title: 'ELLA Studio — Agendamento Online',
-  description: 'Agende seu horário no ELLA Studio de beleza e estética em Valinhos',
+  title: 'ELLA Studio — Gestão',
+  description: 'Sistema interno de gestão do ELLA Studio',
+  icons: { icon: '/marca/logo.png' },
+  // App interno: não deve aparecer no Google
+  robots: { index: false, follow: false },
 }
 
 export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
+  themeColor: '#FFF8F6',
 }
 
 export default function RootLayout({
@@ -19,11 +37,9 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="pt-BR">
-      <body className="bg-ella-light text-ella-dark min-h-screen">
-        <main className="mx-auto max-w-md min-h-screen bg-white shadow-xl">
-          {children}
-        </main>
+    <html lang="pt-BR" className={`${cormorant.variable} ${jost.variable}`}>
+      <body className="min-h-screen bg-ella-light font-sans text-ella-dark">
+        {children}
       </body>
     </html>
   )

@@ -7,12 +7,15 @@ export async function POST(request: Request) {
     const {
       empresa_id,
       cliente_nome,
-      cliente_telefone,
       itens,
       idempotencia_key,
     } = body
 
-    if (!empresa_id || !cliente_nome || !cliente_telefone || !Array.isArray(itens) || itens.length === 0) {
+    // Telefone sempre no formato 55 + DDD + número, para o mesmo cliente não ser criado duas vezes
+    const digitos = String(body.cliente_telefone ?? '').replace(/\D/g, '')
+    const cliente_telefone = digitos.length === 10 || digitos.length === 11 ? `55${digitos}` : digitos
+
+    if (!empresa_id || !cliente_nome || cliente_telefone.length < 12 || !Array.isArray(itens) || itens.length === 0) {
       return NextResponse.json(
         { error: 'Dados incompletos' },
         { status: 400 }

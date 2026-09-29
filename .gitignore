@@ -17,3 +17,4 @@ AUDITORIA_DEPLOY.ps1
 Thumbs.db
 # env files (root)
 .env*
+.vercel

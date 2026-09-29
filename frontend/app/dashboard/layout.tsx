@@ -34,7 +34,7 @@ export default async function DashboardLayout({ children }: LayoutProps) {
   ]
 
   return (
-    <div className="min-h-screen pb-20">
+    <div className="mx-auto min-h-screen max-w-3xl bg-white pb-20 shadow-suave">
       <header className="bg-white border-b border-gray-100 px-4 py-4">
         <div className="flex items-center justify-between">
           <div>

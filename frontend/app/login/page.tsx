@@ -2,13 +2,15 @@
 
 import { useState, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import Link from 'next/link'
+import Image from 'next/image'
 import { supabase } from '@/lib/supabase/client'
 
 function LoginContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const redirect = searchParams.get('redirect') || '/dashboard'
+  // Só aceita caminhos internos, para o link de login não poder mandar para outro site
+  const destino = searchParams.get('redirect') || ''
+  const redirect = destino.startsWith('/') && !destino.startsWith('//') ? destino : '/dashboard'
 
   const [email, setEmail] = useState('')
   const [senha, setSenha] = useState('')
@@ -37,12 +39,12 @@ function LoginContent() {
   }
 
   return (
-    <div className="min-h-screen px-6 py-12 flex flex-col">
-      <div className="flex-1 flex flex-col items-center justify-center text-center mb-10">
-        <h1 className="text-3xl font-bold tracking-tight text-ella-dark mb-2">
-          ELLA Studio
-        </h1>
-        <p className="text-sm text-gray-500">Acesso restrito</p>
+    <div className="flex min-h-screen items-center justify-center px-4 py-12">
+      <div className="w-full max-w-sm rounded-3xl border border-ella-line/70 bg-white p-6 shadow-suave sm:p-8">
+      <div className="mb-8 flex flex-col items-center text-center">
+        <Image src="/marca/logo.png" alt="ELLA Studio" width={88} height={88} priority />
+        <h1 className="mt-4 font-serif text-3xl font-medium">Área da equipe</h1>
+        <p className="mt-1 text-sm text-ella-muted">Acesso restrito</p>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -62,7 +64,7 @@ function LoginContent() {
             onChange={(e) => setEmail(e.target.value)}
             placeholder="seu@email.com"
             required
-            className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-ella-rose focus:outline-none text-base min-h-[44px]"
+            className="campo"
           />
         </div>
 
@@ -76,23 +78,19 @@ function LoginContent() {
             onChange={(e) => setSenha(e.target.value)}
             placeholder="••••••••"
             required
-            className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-ella-rose focus:outline-none text-base min-h-[44px]"
+            className="campo"
           />
         </div>
 
         <button
           type="submit"
           disabled={loading}
-          className="w-full py-4 bg-ella-rose text-white rounded-xl text-center font-semibold text-lg shadow-lg active:scale-[0.98] transition-transform disabled:opacity-50 min-h-[44px]"
+          className="btn-primario w-full"
         >
           {loading ? 'Entrando...' : 'Entrar'}
         </button>
       </form>
 
-      <div className="mt-6 text-center">
-        <Link href="/" className="text-sm text-gray-500 hover:text-ella-rose">
-          ← Voltar ao site
-        </Link>
       </div>
     </div>
   )

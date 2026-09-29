@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server'
-import { supabaseAdmin } from '@/lib/supabase/server'
+import { supabasePublico } from '@/lib/supabase/publico'
 
 export async function POST(request: Request) {
   try {
     const body = await request.json()
 
-    const { data, error } = await supabaseAdmin.rpc('listar_horarios_disponiveis', {
+    // listar_horarios_disponiveis tem EXECUTE liberado para anon: não precisa da chave secreta
+    const { data, error } = await supabasePublico.rpc('listar_horarios_disponiveis', {
       p_empresa_id: body.empresa_id,
       p_servico_id: body.servico_id,
       p_profissional_id: body.profissional_id,

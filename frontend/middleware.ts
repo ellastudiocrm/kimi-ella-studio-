@@ -40,13 +40,15 @@ export async function middleware(request: NextRequest) {
 
   const { pathname } = request.nextUrl
 
-  // Rotas protegidas
-  const protectedRoutes = ['/dashboard', '/admin', '/marketing', '/minhas-reservas']
-  const isProtected = protectedRoutes.some((route) => pathname.startsWith(route))
+  // App interno: tudo exige login, exceto a própria tela de login
+  const rotaLivre = pathname === '/login'
 
-  if (isProtected && !user) {
+  if (!user && !rotaLivre) {
+    if (pathname.startsWith('/api/')) {
+      return NextResponse.json({ error: 'Não autenticado' }, { status: 401 })
+    }
     const loginUrl = new URL('/login', request.url)
-    loginUrl.searchParams.set('redirect', pathname)
+    if (pathname !== '/') loginUrl.searchParams.set('redirect', pathname)
     return NextResponse.redirect(loginUrl)
   }
 
@@ -54,5 +56,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'],
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|marca/|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'],
 }
