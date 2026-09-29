@@ -43,24 +43,22 @@ export default async function DashboardPage() {
     .single()
 
   const profissionalId = (usuario as any)?.usuario_profissional?.[0]?.profissional_id
+  // Admin, gestão e recepção veem a agenda de todas as profissionais
+  const equipe = ['admin', 'gestor', 'recepcao'].includes(usuario?.perfil ?? '')
 
-  if (!profissionalId) {
+  if (!profissionalId && !equipe) {
     return (
       <div className="text-center py-12">
         <p className="text-gray-500">Esta conta não está vinculada a uma profissional.</p>
-        {usuario?.perfil === 'admin' && (
-          <Link href="/admin" className="text-ella-rose hover:underline">
-            Ir para o painel admin
-          </Link>
-        )}
       </div>
     )
   }
 
-  const hoje = new Date().toISOString().split('T')[0]
-  const amanha = new Date(Date.now() + 86400000).toISOString().split('T')[0]
+  const hoje = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date())
+  const inicioDia = new Date(`${hoje}T00:00:00-03:00`)
+  const fimDia = new Date(inicioDia.getTime() + 86400000)
 
-  const { data: itens, error } = await supabase
+  let consulta = supabase
     .from('reserva_itens')
     .select(`
       id,
@@ -78,10 +76,13 @@ export default async function DashboardPage() {
         servico_cardapios (nome_comercial, cardapio)
       )
     `)
-    .eq('profissional_id', profissionalId)
-    .gte('inicio', `${hoje}T00:00:00`)
-    .lt('inicio', `${amanha}T00:00:00`)
+    .gte('inicio', inicioDia.toISOString())
+    .lt('inicio', fimDia.toISOString())
     .order('inicio', { ascending: true })
+
+  if (profissionalId && !equipe) consulta = consulta.eq('profissional_id', profissionalId)
+
+  const { data: itens, error } = await consulta
 
   if (error) {
     console.error('Erro ao carregar agenda:', error)

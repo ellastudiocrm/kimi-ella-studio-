@@ -41,14 +41,9 @@ export default async function DashboardLayout({ children }: LayoutProps) {
             <p className="text-xs text-gray-500">Bom dia,</p>
             <h1 className="text-lg font-bold text-ella-dark">{nome}</h1>
           </div>
-          {(perfil === 'admin' || perfil === 'gestao') && (
-            <Link
-              href="/admin"
-              className="text-xs font-medium text-ella-rose hover:underline"
-            >
-              Admin →
-            </Link>
-          )}
+          <span className="rounded-full bg-ella-soft px-3 py-1 text-xs font-medium text-ella-rose">
+            {perfil}
+          </span>
         </div>
       </header>
 
