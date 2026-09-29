@@ -28,7 +28,7 @@ export async function registrarSinal(reservaId: string, meio: MeioPagamento): Pr
 
   const { data: cobranca, error } = await supabase
     .from('cobrancas')
-    .select('id, valor_sinal, estado, transacoes(valor, estado, finalidade)')
+    .select('id, valor_sinal, estado, transacoes!transacoes_cobranca_id_fkey(valor, estado, finalidade)')
     .eq('reserva_id', reservaId)
     .maybeSingle()
   if (error || !cobranca) return { ok: false, erro: 'Cobrança da reserva não encontrada' }

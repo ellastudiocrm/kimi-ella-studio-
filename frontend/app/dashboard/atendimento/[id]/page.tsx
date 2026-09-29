@@ -17,11 +17,12 @@ export default async function AtendimentoPage({ params }: { params: { id: string
     .from('reserva_itens')
     .select(
       `id, inicio, fim, estado, nome_servico, preco_final, duracao_reservada, observacoes,
-       reservas!inner ( id, estado, valor_total, valor_sinal_total, created_at,
-         clientes ( id, nome, telefone_normalizado ),
-         cobrancas ( valor_sinal, valor_total, estado, transacoes ( valor, estado, finalidade, meio ) ) ),
-       servicos ( nome_tecnico, servico_cardapios ( nome_comercial ) ),
-       profissionais ( id, nome )`
+       reservas!reserva_itens_reserva_id_fkey!inner ( id, estado, valor_total, valor_sinal_total, created_at,
+         clientes!reservas_cliente_id_fkey ( id, nome, telefone_normalizado ),
+         cobrancas!cobrancas_reserva_id_fkey ( valor_sinal, valor_total, estado,
+           transacoes!transacoes_cobranca_id_fkey ( valor, estado, finalidade, meio ) ) ),
+       servicos!reserva_itens_servico_id_fkey ( nome_tecnico, servico_cardapios ( nome_comercial ) ),
+       profissionais!reserva_itens_profissional_id_fkey ( id, nome )`
     )
     .eq('id', params.id)
     .maybeSingle()

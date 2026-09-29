@@ -4,6 +4,8 @@ import { createSessionClient } from '@/lib/supabase/session'
 
 // Consultas do painel interno. Usam a sessão de quem está logado,
 // então a RLS decide o que cada perfil pode ver.
+// As tabelas têm duas FKs entre si (simples e composta com empresa_id), por
+// isso os embeds indicam a FK pelo nome (tabela!nome_da_fk).
 
 export const FUSO_OFFSET = '-03:00' // São Paulo (sem horário de verão desde 2019)
 const PERFIS_EQUIPE = ['admin', 'gestor', 'recepcao']
@@ -49,7 +51,7 @@ export async function profissionaisDaAgenda(): Promise<ProfissionalAgenda[]> {
   const supabase = createSessionClient()
   const { data } = await supabase
     .from('profissionais')
-    .select('id, nome, foto_url, profissional_servicos!inner(servico_id)')
+    .select('id, nome, foto_url, profissional_servicos!profissional_servicos_profissional_id_fkey!inner(servico_id)')
     .eq('ativo', true)
     .order('nome')
 
@@ -106,8 +108,9 @@ export async function carregarAgenda(
     .from('reserva_itens')
     .select(
       `id, inicio, fim, estado, nome_servico, preco_final, profissional_id,
-       reservas!inner ( id, estado, clientes ( nome, telefone_normalizado ) ),
-       servicos ( nome_tecnico, servico_cardapios ( nome_comercial ) )`
+       reservas!reserva_itens_reserva_id_fkey!inner ( id, estado,
+         clientes!reservas_cliente_id_fkey ( nome, telefone_normalizado ) ),
+       servicos!reserva_itens_servico_id_fkey ( nome_tecnico, servico_cardapios ( nome_comercial ) )`
     )
     .gte('inicio', inicio.toISOString())
     .lt('inicio', fim.toISOString())
